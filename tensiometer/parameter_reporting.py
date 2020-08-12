@@ -62,6 +62,14 @@ def get_mode1d(chain, param_names, settings=None):
 
 def get_mean(chain, param_names):
     """
+    Utility to compute the parameter mean.
+    Mostly this is an utility to get the mean from parameter names rather than
+    parameter indexes as we would do in GetDist.
+
+    :param chain: :class:`~getdist.mcsamples.MCSamples` the input chain.
+    :param param_names: optional choice of parameter names to
+        restrict the calculation. Default is all parameters.
+    :return: an array with the mean.
     """
     # initial check of parameter names:
     if param_names is None:
