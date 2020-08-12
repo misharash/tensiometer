@@ -25,7 +25,7 @@ from getdist import MCSamples
 from . import gaussian_tension as gtens
 
 ###############################################################################
-# function to get the peak of the 1d posterior:
+# utility functions to get mean and 1d mode:
 
 
 def get_mode1d(chain, param_names):
@@ -45,7 +45,17 @@ def get_mode1d(chain, param_names):
     return param_mode
 
 
-
+def get_mean(chain, param_names):
+    """
+    """
+    # initial check of parameter names:
+    if param_names is None:
+        param_names = chain.getParamNames().list()
+    param_names = gtens._check_param_names(chain, param_names)
+    # get indexes of parameters:
+    _indexes = [chain.index[p] for p in param_names]
+    #
+    return chain.getMeans(_indexes)
 
 
 
