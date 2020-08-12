@@ -29,6 +29,7 @@ Other examples are provided for specific tasks.
    mcmc_tension
    gaussian_tension
    chains_convergence
+   parameter_reporting
    cosmosis_interface
    utilities
 
