@@ -78,6 +78,36 @@ def get_mean(chain, param_names):
     return chain.getMeans(_indexes)
 
 
+def get_best_fit_params(chain, param_names):
+    """
+    Utility to compute the parameter best fit.
+    This tries to load the best fit from file and if it fails reports
+    the best fit from samples (which could be noisy).
+
+    :param chain: :class:`~getdist.mcsamples.MCSamples` the input chain.
+    :param param_names: optional choice of parameter names to
+        restrict the calculation. Default is all parameters.
+    :return: an array with the best fit.
+    """
+    # initial check of parameter names:
+    if param_names is None:
+        param_names = chain.getParamNames().list()
+    param_names = gtens._check_param_names(chain, param_names)
+    # get the best fit:
+    try:
+        # from file:
+        bestfit = chain.getBestFit()
+        bestfit = [par.best_fit for par in bestfit.parsWithNames(param_names)]
+    except MCSamplesError:
+        # have to get best fit from samples:
+        bestfit = [par.bestfit_sample for par in
+                   chain.getMargeStats().parsWithNames(param_names)]
+    except Exception as ex:
+        print(ex)
+    #
+    return np.array(bestfit)
+
+
 def get_PJHPD_bounds(chain, param_names, levels):
     """
     Compute some estimate of the global ML confidence interval as described in
@@ -104,6 +134,9 @@ def get_PJHPD_bounds(chain, param_names, levels):
         idx = chain.index[p]
         # get the density spline:
         density = chain.get1DDensity(p)
+        # make sure we have the spline ready:
+        if density.spl is None:
+            density._initSpline()
         # normalize:
         param_array = chain.samples[sort_idx, idx]
         norm_factor = interpol.splint(np.amin(param_array),
