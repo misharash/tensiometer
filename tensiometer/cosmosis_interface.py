@@ -5,10 +5,9 @@ File with tools to interface Cosmosis chains with GetDist.
 """
 For testing purposes:
 
-chain = loadMCSamples('./../test_chains/1p2_SN1_zcut0p3_abs')
-chain_root = './../test_chains/d_1sigD_s8/d_TTlite_1sigD_s8_noisy_poly_chain'
-chain_root = './../test_chains/d_1sigD_s8'
+chain_root = './test_chains/DES_multinest_cosmosis'
 param_label_dict=None
+settings=None
 """
 
 import os
@@ -98,6 +97,8 @@ def MCSamplesFromCosmosis(chain_root, param_label_dict=None, name_tag=None,
                            labels=param_labels, ranges=ranges,
                            ignore_rows=0, name_tag=name_tag,
                            settings=settings)
+    # set the chain root:
+    mc_samples.root = os.path.splitext(chain_file)[0]
     # set running parameters:
     for name in mc_samples.getParamNames().parsWithNames(
             mc_samples.getParamNames().list()):

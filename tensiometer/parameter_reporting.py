@@ -21,6 +21,9 @@ import tensiometer.tensor_eigenvalues as teig
 import copy
 import numpy as np
 from getdist import MCSamples
+import getdist.types as types
+from getdist.mcsamples import MCSamplesError
+import scipy.interpolate as interpol
 
 from . import gaussian_tension as gtens
 
@@ -80,11 +83,113 @@ def get_mean(chain, param_names):
     #
     return chain.getMeans(_indexes)
 
+
+def get_PJHPD_bounds(chain, param_names, levels):
+    """
+    """
+    # initial check of parameter names:
+    if param_names is None:
+        param_names = chain.getParamNames().list()
+    param_names = gtens._check_param_names(chain, param_names)
+    # digest levels:
+    lev = np.atleast_1d(levels)
+    # sort the samples:
+    sort_idx = np.argsort(chain.loglikes)
+    # cycle over parameters:
+    results = []
+    for p in param_names:
+        # get the parameter index:
+        idx = chain.index[p]
+        # get the density spline:
+        density = chain.get1DDensity(p)
+        # normalize:
+        param_array = chain.samples[sort_idx, idx]
+        norm_factor = interpol.splint(np.amin(param_array),
+                                      np.amax(param_array),
+                                      density.spl)
+        # precompute the integrals:
+        lmax = np.amax(lev)
+        vmin, vmax, int = [param_array[0]], [param_array[0]], [0]
+        for par in param_array:
+            if par < vmin[-1] or par > vmax[-1]:
+                if par < vmin[-1]:
+                    vmin.append(par)
+                    vmax.append(vmax[-1])
+                if par > vmax[-1]:
+                    vmax.append(par)
+                    vmin.append(vmin[-1])
+                int.append(interpol.splint(vmin[-1],
+                                           vmax[-1],
+                                           density.spl)/norm_factor)
+                if int[-1] > lmax:
+                    break
+        # evaluate the interpolation of the bounds:
+        results.append(np.stack((np.interp(lev, int, vmin),
+                                 np.interp(lev, int, vmax))).T)
+    #
+    return results
+
 ###############################################################################
-#
+# Parameter table function:
 
 
-
-
-
-pass
+def parameter_table(chain, param_names, use_peak=False, use_best_fit=True,
+                    use_PJHPD_bounds=False, ncol=1, analysis_settings=None,
+                    **kwargs):
+    """
+    """
+    # initial check of parameter names:
+    if param_names is None:
+        param_names = chain.getParamNames().list()
+    param_names = gtens._check_param_names(chain, param_names)
+    # get parameter indexes:
+    param_index = [chain.index[p] for p in param_names]
+    # get marge stats:
+    marge = copy.deepcopy(chain.getMargeStats())
+    # if we want to use the peak substitute the mean in marge:
+    if use_peak:
+        mode = get_mode1d(chain, param_names, settings=analysis_settings)
+        for num, ind in enumerate(param_index):
+            marge.names[ind].mean = mode[num]
+    # get the best fit:
+    if use_best_fit:
+        # get the best fit object from file or sample:
+        try:
+            bestfit = chain.getBestFit()
+        except MCSamplesError:
+            # have to get best fit from samples:
+            bfidx = np.argmin(chain.loglikes)
+            bestfit = types.BestFit()
+            bestfit.names = copy.deepcopy(chain.paramNames.names)
+            for nam in bestfit.names:
+                nam.best_fit = nam.bestfit_sample
+            bestfit.logLike = chain.loglikes[bfidx]
+        # if we want PJHPD bounds we have to compute and add them:
+        if use_PJHPD_bounds:
+            # compute bounds (note have to do for all parameters):
+            temp = get_PJHPD_bounds(chain,
+                                    param_names=None,
+                                    levels=marge.limits)
+            # initialize another marge object:
+            marge2 = copy.deepcopy(marge)
+            for nam in marge2.names:
+                # center:
+                temp_bf = bestfit.parWithName(nam.name)
+                nam.mean = temp_bf.best_fit
+                # PJHPD bouds:
+                temp_bounds = temp[chain.index[nam.name]]
+                for lim, tmp in zip(nam.limits, temp_bounds):
+                    lim.twotail = True
+                    lim.onetail_lower = False
+                    lim.onetail_upper = False
+                    lim.lower = tmp[0]
+                    lim.upper = tmp[1]
+            # prepare the table:
+            table = types.ResultTable(ncol, [marge, marge2],
+                                      paramList=param_names, **kwargs)
+        else:
+            marge.addBestFit(bestfit)
+            table = types.ResultTable(ncol, [marge],
+                                      paramList=param_names, **kwargs)
+    #
+    return table
