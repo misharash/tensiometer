@@ -31,7 +31,7 @@ from . import gaussian_tension as gtens
 # utility functions to get mean and 1d mode:
 
 
-def get_mode1d(chain, param_names, settings=None):
+def get_mode1d(chain, param_names):
     """
     Utility to compute the peak of the 1d posterior distribution for all
     parameters (parameter 1d mode).
@@ -41,18 +41,12 @@ def get_mode1d(chain, param_names, settings=None):
     :param chain: :class:`~getdist.mcsamples.MCSamples` the input chain.
     :param param_names: optional choice of parameter names to
         restrict the calculation. Default is all parameters.
-    :param settings: optional dictionary with GetDist analysis settings
-        to use for the 1d mode calculation.
-        This will change the analysis settings of the chain globally.
     :return: an array with the 1d mode.
     """
     # initial check of parameter names:
     if param_names is None:
         param_names = chain.getParamNames().list()
     param_names = gtens._check_param_names(chain, param_names)
-    # KDE settings:
-    if settings is not None:
-        chain.updateSettings(settings=settings, doUpdate=True)
     # get the maximum probability from the precomputed pdf:
     param_mode = []
     for p in param_names:
@@ -86,6 +80,14 @@ def get_mean(chain, param_names):
 
 def get_PJHPD_bounds(chain, param_names, levels):
     """
+    Compute some estimate of the global ML confidence interval as described in
+    https://arxiv.org/pdf/2007.01844.pdf
+
+    :param chain: :class:`~getdist.mcsamples.MCSamples` the input chain.
+    :param param_names: optional choice of parameter names to
+        restrict the calculation. Default is all parameters.
+    :param levels: array with confidence levels to compute, i.e. [0.68, 0.95]
+    :return: an array with the bounds for each parameter.
     """
     # initial check of parameter names:
     if param_names is None:
@@ -134,9 +136,22 @@ def get_PJHPD_bounds(chain, param_names, levels):
 
 
 def parameter_table(chain, param_names, use_peak=False, use_best_fit=True,
-                    use_PJHPD_bounds=False, ncol=1, analysis_settings=None,
-                    **kwargs):
+                    use_PJHPD_bounds=False, ncol=1, **kwargs):
     """
+    Generate latex parameter table with summary results.
+
+    :param chain: :class:`~getdist.mcsamples.MCSamples` the input chain.
+    :param param_names: optional choice of parameter names to
+        restrict the calculation. Default is all parameters.
+    :param use_peak: whether to use the peak of the 1d distribution instead of
+        the mean. Default is False.
+    :param use_best_fit: whether to include the best fit either from explicit
+        minimization or sample. Default True.
+    :param use_PJHPD_bounds: whether to report PJHPD bounds. Default False.
+    :param ncol: number of columns for the table. Default 1.
+    :param analysis_settings: optional analysis settings to use.
+    :param kwargs: arguments for :class:`~getdist.types.ResultTable`
+    :return: a :class:`~getdist.types.ResultTable`
     """
     # initial check of parameter names:
     if param_names is None:
@@ -148,7 +163,7 @@ def parameter_table(chain, param_names, use_peak=False, use_best_fit=True,
     marge = copy.deepcopy(chain.getMargeStats())
     # if we want to use the peak substitute the mean in marge:
     if use_peak:
-        mode = get_mode1d(chain, param_names, settings=analysis_settings)
+        mode = get_mode1d(chain, param_names)
         for num, ind in enumerate(param_index):
             marge.names[ind].mean = mode[num]
     # get the best fit:
@@ -191,5 +206,8 @@ def parameter_table(chain, param_names, use_peak=False, use_best_fit=True,
             marge.addBestFit(bestfit)
             table = types.ResultTable(ncol, [marge],
                                       paramList=param_names, **kwargs)
+    else:
+        table = types.ResultTable(ncol, [marge],
+                                  paramList=param_names, **kwargs)
     #
     return table
