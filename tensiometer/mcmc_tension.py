@@ -742,3 +742,216 @@ def exact_parameter_shift(diff_chain, param_names=None,
                                                         alpha=0.32)
     #
     return _P, _low, _upper
+
+
+###############################################################################
+# Flow-based gaussianization:
+
+import tensorflow as tf
+# tf.enable_v2_behavior()
+# tf.config.run_functions_eagerly(True)
+import tensorflow_probability as tfp
+tfb = tfp.bijectors
+tfd = tfp.distributions
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input
+
+from IPython.display import clear_output, set_matplotlib_formats
+import scipy.stats
+from . import gaussian_tension
+
+from matplotlib import pyplot as plt
+
+class DiffFlowCallback(tf.keras.callbacks.Callback):
+    def __init__(self, X, model, dist_gaussian_approx, dist_transformed, feedback=1, make_plots=True, **kwargs):
+        # Model
+        self.model = model
+
+        # Distributions
+        self.dist_gaussian_approx = dist_gaussian_approx
+        self.dist_transformed = dist_transformed
+
+        # Bijectors
+        self.Z2Y_bijector = self.dist_transformed.bijector
+        self.Y2X_bijector = self.dist_gaussian_approx.bijector
+        self.Z2X_bijector = tfb.Chain([self.Y2X_bijector, self.Z2Y_bijector])
+
+        # Data
+        self.X = X
+        self.Y = np.array(self.Y2X_bijector.inverse(self.X))
+        assert not np.any(np.isnan(self.Y))
+        self.n = self.Y.shape[1]
+
+        # Metrics
+        keys = ["loss", "shift_proba"]
+        self.log = {_k:[] for _k in keys}
+
+        self.chi2Y = np.sum(self.Y**2, axis=1)
+        self.chi2Y_ks, self.chi2Y_ks_p = scipy.stats.kstest(self.chi2Y, 'chi2', args=(self.n,))
+
+        # Options
+        self.make_plots = make_plots
+        self.feedback = feedback
+    
+    def train(self, batch_size=256, epochs=100, steps_per_epoch=32, callbacks=[], verbose=1):
+        self.model.fit(x=self.Y, y=np.zeros(self.Y.shape[0], dtype=np.float32),
+                        batch_size=batch_size,
+                        epochs=epochs,
+                        # sample_weight=diff_chain.weights, # NOT YET SUPPORTED (maybe resample chain)
+                        steps_per_epoch=steps_per_epoch, 
+                        shuffle=True,
+                        verbose=verbose,
+                        callbacks=[tf.keras.callbacks.TerminateOnNaN(), self]+callbacks)
+    
+    def compute_shift_proba(self):
+        chi2Z0 = np.sum(np.array(self.Z2X_bijector.inverse(np.zeros(self.n, dtype=np.float32)))**2)
+        # return scipy.stats.chi2.cdf(chi2Z0, df=self.n)
+        pval = scipy.stats.chi2.cdf(chi2Z0, df=self.n)
+        return utils.from_confidence_to_sigma(pval)
+
+    def plot_loss(self, ax, logs={}):
+        self.log["loss"].append(logs.get('loss'))
+        if ax is not None:
+            ax.plot(np.ma.masked_array(np.array(self.log["loss"]), utils.is_outlier(np.array(self.log["loss"]))))
+            ax.set_title("Training Loss")
+            ax.set_xlabel("Epoch #")
+            ax.set_ylabel("Loss")
+        
+    def plot_shift_proba(self, ax, logs={}):
+        shift_proba = self.compute_shift_proba()
+        self.log["shift_proba"].append(shift_proba)
+        if ax is not None:
+            ax.plot(self.log["shift_proba"])
+            # ax.set_title("Shift probability")
+            ax.set_title("Shift significance ($\sigma$)")
+            ax.set_xlabel("Epoch #")
+            # ax.set_ylabel("Probability")
+            ax.set_ylabel("$\sigma$")
+            # ax.set_yscale("logit")
+
+    def plot_chi2_dist(self, ax, logs={}):
+        chi2Z = np.sum(np.array(self.Z2Y_bijector.inverse(self.Y))**2, axis=1)
+        chi2Z = chi2Z[np.isfinite(chi2Z)]
+        try:
+            chi2Z_ks, chi2Z_ks_p = scipy.stats.kstest(chi2Z, 'chi2', args=(self.n,))
+        except:
+            chi2Z_ks, chi2Z_ks_p = 0., 0.
+
+        xx = np.linspace(0, self.n*4, 1000)
+        bins = np.linspace(0, self.n*4, 100)
+        if ax is not None:
+            ax.plot(xx, scipy.stats.chi2.pdf(xx, df=self.n), label='$\chi^2_{}$ PDF'.format(self.n), c='k', lw=1)
+            ax.hist(self.chi2Y, bins=bins, density=True, histtype='step', color='orange', label='Pre-gauss ($D_n$={:.3f})'.format(self.chi2Y_ks)); #, $p$={:.3f})'.format(self.chi2Y_ks, self.chi2Y_ks_p));
+            ax.hist(chi2Z, bins=bins, density=True, histtype='step', color='dodgerblue', label='Post-gauss ($D_n$={:.3f})'.format(chi2Z_ks)); #, $p$={:.3f})'.format(chi2Z_ks, chi2Z_ks_p));
+            ax.set_title('$\chi^2_{}$ PDF'.format(self.n))
+            ax.set_xlabel('$\chi^2$')
+            ax.legend(fontsize=8)
+
+    def on_epoch_end(self, epoch, logs={}):
+        if self.make_plots:
+            clear_output(wait=True)
+            fig, axes = plt.subplots(1,3,figsize=(12,3))
+        else:
+            axes = [None]*4
+
+
+        self.plot_loss(axes[0], logs=logs)
+        self.plot_shift_proba(axes[1], logs=logs)
+        self.plot_chi2_dist(axes[2], logs=logs)
+
+        plt.tight_layout()
+        plt.show()
+    
+
+
+
+def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.leaky_relu, learning_rate=1e-4, feedback=0, **kwargs):
+    """[summary]
+
+    :param num_params: [description]
+    :type num_params: [type]
+    :param n_maf: [description], defaults to None
+    :type n_maf: [type], optional
+    :param hidden_units: [description], defaults to None
+    :type hidden_units: [type], optional
+    :param activation: [description], defaults to tf.nn.leaky_relu
+    :type activation: [type], optional
+    :param learning_rate: [description], defaults to 1e-4
+    :type learning_rate: [type], optional
+    :return: [description]
+    :rtype: [type]
+    """
+    if n_maf is None:
+        n_maf = 2*num_params
+    event_shape = (num_params,)
+    
+    if hidden_units is None:
+        hidden_units = [num_params*2]*2
+
+    # Build transformed distribution
+    bijectors = []
+    for i in range(n_maf):
+        made = tfb.AutoregressiveNetwork(params=2, event_shape=event_shape, hidden_units=hidden_units, activation=activation)
+        bijectors.append(tfb.MaskedAutoregressiveFlow(shift_and_log_scale_fn=made))
+        bijectors.append(tfb.Permute(np.random.permutation(num_params)))
+    bijector = tfb.Chain(bijectors)
+    transf_dist = tfd.TransformedDistribution(
+        distribution=tfd.MultivariateNormalDiag(np.zeros(num_params, dtype=np.float32), np.ones(num_params, dtype=np.float32)),
+        bijector=bijector)
+
+    # Construct model
+    x_ = Input(shape=event_shape, dtype=tf.float32)
+    log_prob_ = transf_dist.log_prob(x_)
+    model = Model(x_, log_prob_)
+    
+    # Compile with log_prob loss
+    model.compile(optimizer=tf.optimizers.Adam(learning_rate=learning_rate), loss=lambda _, log_prob: -log_prob,)
+    
+    if feedback>0:
+        print("Building MAF")
+        print("    - trainable parameters:", model.count_params())
+        print("    - activation:", activation)
+        print("    - hidden_units:", hidden_units)
+
+    return transf_dist, model
+
+
+
+def flow_parameter_shift(diff_chain, param_names=None,
+                         feedback=1, **kwargs):
+    """
+    Notations:
+        - X designates samples in the original parameter difference space;
+        - Y designates samples in the gaussian approximation space, computed from mean(X) and cov(X);
+        - Z designates samples in the gaussianized space, connected to Y with a normalizing flow, with Z~N(0,1).
+    """
+    
+    # initialize param names:
+    if param_names is None:
+        param_names = diff_chain.getParamNames().getRunningNames()
+    else:
+        chain_params = diff_chain.getParamNames().list()
+        if not np.all([name in chain_params for name in param_names]):
+            raise ValueError('Input parameter is not in the diff chain.\n',
+                             'Input parameters ', param_names, '\n'
+                             'Possible parameters', chain_params)
+    
+    # indexes:
+    ind = [diff_chain.index[name] for name in param_names]
+    num_params = len(ind)
+    
+    # Gaussian approximation
+    mcsamples_gaussian_approx = gaussian_tension.gaussian_approximation(diff_chain, param_names=param_names)
+    dist_gaussian_approx = tfd.MultivariateNormalTriL(loc=mcsamples_gaussian_approx.means[0].astype(np.float32), scale_tril=tf.linalg.cholesky(mcsamples_gaussian_approx.covs[0].astype(np.float32)))
+    
+    # MAF
+    transformed_distribution, model = _build_dist_maf(num_params, feedback=feedback, **kwargs)
+
+    # Samples
+    X = diff_chain.samples[:,ind]
+
+    # Callback/model handler
+    diff_flow_callback = DiffFlowCallback(X, model, dist_gaussian_approx, transformed_distribution, feedback=feedback, make_plots=True)
+
+    return diff_flow_callback
