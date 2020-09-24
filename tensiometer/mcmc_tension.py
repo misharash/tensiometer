@@ -762,6 +762,7 @@ import scipy.stats
 from . import gaussian_tension
 
 from matplotlib import pyplot as plt
+from collections.abc import Iterable
 
 class DiffFlowCallback(tf.keras.callbacks.Callback):
     def __init__(self, X, model, dist_gaussian_approx, dist_transformed, feedback=1, make_plots=True, **kwargs):
@@ -769,8 +770,8 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         self.model = model
 
         # Distributions
-        self.dist_gaussian_approx = dist_gaussian_approx
-        self.dist_transformed = dist_transformed
+        self.dist_gaussian_approx = dist_gaussian_approx # samples the gaussian approx to X
+        self.dist_transformed = dist_transformed # samples from std gaussian mapped to Y
 
         # Bijectors
         self.Z2Y_bijector = self.dist_transformed.bijector
@@ -783,6 +784,8 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         assert not np.any(np.isnan(self.Y))
         self.n = self.Y.shape[1]
 
+        self.dist_learned = tfd.TransformedDistribution(distribution=tfd.MultivariateNormalDiag(np.zeros(self.n, dtype=np.float32), np.ones(self.n, dtype=np.float32)), bijector=self.Z2X_bijector) # samples from std gaussian mapped to X
+
         # Metrics
         keys = ["loss", "shift_proba"]
         self.log = {_k:[] for _k in keys}
@@ -794,7 +797,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         self.make_plots = make_plots
         self.feedback = feedback
     
-    def train(self, batch_size=256, epochs=100, steps_per_epoch=32, callbacks=[], verbose=1):
+    def train(self, batch_size=256, epochs=100, steps_per_epoch=32, callbacks=[], verbose=1, **kwargs):
         self.model.fit(x=self.Y, y=np.zeros(self.Y.shape[0], dtype=np.float32),
                         batch_size=batch_size,
                         epochs=epochs,
@@ -802,7 +805,8 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
                         steps_per_epoch=steps_per_epoch, 
                         shuffle=True,
                         verbose=verbose,
-                        callbacks=[tf.keras.callbacks.TerminateOnNaN(), self]+callbacks)
+                        callbacks=[tf.keras.callbacks.TerminateOnNaN(), self]+callbacks,
+                        **kwargs)
     
     def compute_shift_proba(self):
         chi2Z0 = np.sum(np.array(self.Z2X_bijector.inverse(np.zeros(self.n, dtype=np.float32)))**2)
@@ -841,7 +845,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         xx = np.linspace(0, self.n*4, 1000)
         bins = np.linspace(0, self.n*4, 100)
         if ax is not None:
-            ax.plot(xx, scipy.stats.chi2.pdf(xx, df=self.n), label='$\chi^2_{}$ PDF'.format(self.n), c='k', lw=1)
+            ax.plot(xx, scipy.stats.chi2.pdf(xx, df=self.n), label='$\chi^2_{{{}}}$ PDF'.format(self.n), c='k', lw=1)
             ax.hist(self.chi2Y, bins=bins, density=True, histtype='step', color='orange', label='Pre-gauss ($D_n$={:.3f})'.format(self.chi2Y_ks)); #, $p$={:.3f})'.format(self.chi2Y_ks, self.chi2Y_ks_p));
             ax.hist(chi2Z, bins=bins, density=True, histtype='step', color='dodgerblue', label='Post-gauss ($D_n$={:.3f})'.format(chi2Z_ks)); #, $p$={:.3f})'.format(chi2Z_ks, chi2Z_ks_p));
             ax.set_title('$\chi^2_{}$ PDF'.format(self.n))
@@ -866,7 +870,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
 
 
 
-def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.leaky_relu, learning_rate=1e-4, feedback=0, **kwargs):
+def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.leaky_relu, permutations=True, learning_rate=1e-4, feedback=0, **kwargs):
     """[summary]
 
     :param num_params: [description]
@@ -889,12 +893,25 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
     if hidden_units is None:
         hidden_units = [num_params*2]*2
 
+    if permutations is None:
+        _permutations = False
+    elif isinstance(permutations, Iterable):
+        assert len(permutations)==n_maf
+        _permutations = permutations
+    elif isinstance(permutations, bool):
+        if permutations:
+            _permutations = [np.random.permutation(num_params) for _ in range(n_maf)]
+        else:
+            _permutations = False
+
     # Build transformed distribution
     bijectors = []
     for i in range(n_maf):
+        if _permutations:
+            bijectors.append(tfb.Permute(_permutations[i]))
         made = tfb.AutoregressiveNetwork(params=2, event_shape=event_shape, hidden_units=hidden_units, activation=activation)
         bijectors.append(tfb.MaskedAutoregressiveFlow(shift_and_log_scale_fn=made))
-        bijectors.append(tfb.Permute(np.random.permutation(num_params)))
+        
     bijector = tfb.Chain(bijectors)
     transf_dist = tfd.TransformedDistribution(
         distribution=tfd.MultivariateNormalDiag(np.zeros(num_params, dtype=np.float32), np.ones(num_params, dtype=np.float32)),
