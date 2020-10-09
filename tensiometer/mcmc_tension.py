@@ -764,124 +764,194 @@ from . import gaussian_tension
 from matplotlib import pyplot as plt
 from collections.abc import Iterable
 
+from scipy.stats import binom
+from scipy.optimize import bisect
+
 class DiffFlowCallback(tf.keras.callbacks.Callback):
-    def __init__(self, X, weights, model, dist_gaussian_approx, dist_transformed, feedback=1, make_plots=True, **kwargs):
+    """
+    Notations:
+        - X designates samples in the original parameter difference space;
+        - Y designates samples in the gaussian approximation space, computed from mean(X) and cov(X);
+        - Z designates samples in the gaussianized space, connected to Y with a normalizing flow, with Z~N(0,1).
+    """
+    def __init__(self, diff_chain, param_names=None, Z2Y_bijector='MAF', pregauss_bijector=None, learning_rate=1e-4, feedback=1, **kwargs):
+        # Chain
+        self._init_diff_chain(diff_chain, param_names=None)
+
         # Model
-        self.model = model
+        if Z2Y_bijector == 'MAF':
+            Z2Y_bijector = _build_dist_maf(self.num_params, **kwargs, feedback=feedback)
+        assert isinstance(Z2Y_bijector, tfp.bijectors.Bijector)
 
-        # Distributions
-        self.dist_gaussian_approx = dist_gaussian_approx # samples the gaussian approx to X
-        self.dist_transformed = dist_transformed # samples from std gaussian mapped to Y
+        # Transformed distribution
+        self._init_transf_dist(Z2Y_bijector, learning_rate=1e-4)
+        if feedback>0:
+            print("Building flow")
+            print("    - trainable parameters:", self.model.count_params())
 
-        # Bijectors
-        self.Z2Y_bijector = self.dist_transformed.bijector
-        self.Y2X_bijector = self.dist_gaussian_approx.bijector
+        # Full bijector
         self.Z2X_bijector = tfb.Chain([self.Y2X_bijector, self.Z2Y_bijector])
 
-        # Data
-        self.weights = weights
-        self.X = X
-        self.Y = np.array(self.Y2X_bijector.inverse(self.X))
-        assert not np.any(np.isnan(self.Y))
-        self.n = self.Y.shape[1]
-
-        Y_ds = tf.data.Dataset.from_tensor_slices((self.Y.astype(np.float32), np.zeros(self.Y.shape[0], dtype=np.float32), self.weights * len(self.weights) / np.sum(self.weights),))
-        Y_ds = Y_ds.prefetch(tf.data.experimental.AUTOTUNE)
-        Y_ds = Y_ds.cache()
-        # Y_ds = Y_ds.shuffle(self.n)
-        # Y_ds = Y_ds.batch(BATCH_SIZE)
-        self.Y_ds = Y_ds
-
         # Full distribution
-        self.dist_learned = tfd.TransformedDistribution(distribution=tfd.MultivariateNormalDiag(np.zeros(self.n, dtype=np.float32), np.ones(self.n, dtype=np.float32)), bijector=self.Z2X_bijector) # samples from std gaussian mapped to X
+        self.dist_learned = tfd.TransformedDistribution(distribution=tfd.MultivariateNormalDiag(np.zeros(self.num_params, dtype=np.float32), np.ones(self.num_params, dtype=np.float32)), bijector=self.Z2X_bijector) # samples from std gaussian mapped to X
 
         # Metrics
-        keys = ["loss", "shift_pval", "shift_nsigma"]
+        keys = ["loss", "shift0_pval", "shift0_nsigma"]
         self.log = {_k:[] for _k in keys}
 
         self.chi2Y = np.sum(self.Y**2, axis=1)
-        self.chi2Y_ks, self.chi2Y_ks_p = scipy.stats.kstest(self.chi2Y, 'chi2', args=(self.n,))
+        self.chi2Y_ks, self.chi2Y_ks_p = scipy.stats.kstest(self.chi2Y, 'chi2', args=(self.num_params,))
 
         # Options
-        self.make_plots = make_plots
         self.feedback = feedback
-    
-    def train(self, batch_size=256, epochs=100, steps_per_epoch=32, callbacks=[], verbose=1, **kwargs):
-        _Y_ds = self.Y_ds.shuffle(self.n, reshuffle_each_iteration=True).repeat().batch(batch_size)
+        
+        # Pre-gaussianization
+        if pregauss_bijector is not None:
+            # The idea is to introduce yet another step of deterministic gaussianization, eg using the prior CDF
+            # or double prior (convolved with itself, eg a triangular distribution)
+            raise NotImplementedError
 
-        # self.model.fit(x=self.Y_ds, y=np.zeros(self.Y.shape[0], dtype=np.float32),
-        hist = self.model.fit(x=_Y_ds,
+    def _init_diff_chain(self, diff_chain, param_names=None):
+        # initialize param names:
+        if param_names is None:
+            param_names = diff_chain.getParamNames().getRunningNames()
+        else:
+            chain_params = diff_chain.getParamNames().list()
+            if not np.all([name in chain_params for name in param_names]):
+                raise ValueError('Input parameter is not in the diff chain.\n',
+                                'Input parameters ', param_names, '\n'
+                                'Possible parameters', chain_params)
+        
+        # indexes:
+        ind = [diff_chain.index[name] for name in param_names]
+        self.num_params = len(ind)
+        
+        # Gaussian approximation
+        mcsamples_gaussian_approx = gaussian_tension.gaussian_approximation(diff_chain, param_names=param_names)
+        self.dist_gaussian_approx = tfd.MultivariateNormalTriL(loc=mcsamples_gaussian_approx.means[0].astype(np.float32), scale_tril=tf.linalg.cholesky(mcsamples_gaussian_approx.covs[0].astype(np.float32)))
+        self.Y2X_bijector = self.dist_gaussian_approx.bijector
+
+        # Samples
+        self.X = diff_chain.samples[:,ind]
+        self.weights = diff_chain.weights
+        self.Y = np.array(self.Y2X_bijector.inverse(self.X))
+        assert not np.any(np.isnan(self.Y))
+
+        Y_ds = tf.data.Dataset.from_tensor_slices((self.Y.astype(np.float32),
+                                                   np.zeros(self.Y.shape[0], dtype=np.float32),
+                                                   self.weights * len(self.weights) / np.sum(self.weights),)) #normalize weights to number of samples
+        Y_ds = Y_ds.prefetch(tf.data.experimental.AUTOTUNE).cache()
+        self.Y_ds = Y_ds.shuffle(self.num_params, reshuffle_each_iteration=True).repeat()
+
+    def _init_transf_dist(self, Z2Y_bijector, learning_rate=1e-4):
+        self.Z2Y_bijector = Z2Y_bijector
+        self.dist_transformed = tfd.TransformedDistribution(distribution=tfd.MultivariateNormalDiag(np.zeros(self.num_params, dtype=np.float32), np.ones(self.num_params, dtype=np.float32)), bijector=Z2Y_bijector)
+
+        # Construct model
+        x_ = Input(shape=(self.num_params,), dtype=tf.float32)
+        log_prob_ = self.dist_transformed.log_prob(x_)
+        self.model = Model(x_, log_prob_)
+
+        self.model.compile(optimizer=tf.optimizers.Adam(learning_rate=learning_rate), loss=lambda _, log_prob: -tf.reduce_mean(tf.boolean_mask(log_prob, tf.math.is_finite(log_prob))))
+
+    def train(self, batch_size=256, epochs=100, steps_per_epoch=32, callbacks=[], verbose=1, **kwargs):
+        hist = self.model.fit(x=self.Y_ds.batch(batch_size),
                         batch_size=batch_size,
                         epochs=epochs,
-                        # sample_weight=self.weights * len(self.weights) / np.sum(self.weights), #diff_chain.weights, # NOT YET SUPPORTED (maybe resample chain)
                         steps_per_epoch=steps_per_epoch, 
-                        shuffle=True,
                         verbose=verbose,
                         callbacks=[tf.keras.callbacks.TerminateOnNaN(), self]+callbacks,
                         **kwargs)
 
         return hist
 
-    # def sample_learned_dist(self, N, return_chain=True):
-    #     samples = np.array(flow_callback.dist_learned.sample(10000))
-    #     if return_chain
-    #         return MCSamples(samples=samples, names=[_x.name for _x in diff_chain.paramNames.names], labels=diff_chain.paramNames.labels(), label='learned')
+    def estimate_shift_significance(self, tol=0.05, max_iter=1000, step=1000000):
+        err = np.inf
+        counter = max_iter
+
+        _thres = self.dist_learned.log_prob(np.zeros(self.num_params, dtype=np.float32))
+
+        def binomial_ci( k, N, alpha):
+            to_minimise = lambda c: binom.cdf(k,N,c)-alpha
+            return bisect(to_minimise,0,1)
+
+        res = []
+        while err>tol and counter>=0:
+            _s = self.dist_learned.sample(step)
+            res += list(np.array(self.dist_learned.log_prob(_s) > _thres))
+            
+            r = np.array(res)
+            k = np.sum(r)
+            N = len(r)
+            p = float(k)/N
+    
+            if k==0:
+                continue
+
+            try:
+                pu = binomial_ci(k, N, 1.-0.68/2)
+                pl = binomial_ci(k, N, 0.68/2)
+            except:
+                print(k,N,"error")
+                continue
+            err = np.abs(utils.from_confidence_to_sigma(pu)-utils.from_confidence_to_sigma(pl))
+            counter -= 1
+
+        return p, utils.from_confidence_to_sigma(p)
+
     
     def compute_shift_proba(self):
-        zero = np.array(self.Z2X_bijector.inverse(np.zeros(self.n, dtype=np.float32)))
+        zero = np.array(self.Z2X_bijector.inverse(np.zeros(self.num_params, dtype=np.float32)))
         chi2Z0 = np.sum(zero**2)
-        # return scipy.stats.chi2.cdf(chi2Z0, df=self.n)
-        pval = scipy.stats.chi2.cdf(chi2Z0, df=self.n)
+        pval = scipy.stats.chi2.cdf(chi2Z0, df=self.num_params)
         nsigma = utils.from_confidence_to_sigma(pval)
         return zero, pval, nsigma
 
     def plot_loss(self, ax, logs={}):
         self.log["loss"].append(logs.get('loss'))
         if ax is not None:
-            ax.plot(np.ma.masked_array(np.array(self.log["loss"]), utils.is_outlier(np.array(self.log["loss"]))))
+            # ax.plot(np.ma.masked_array(np.array(self.log["loss"]), utils.is_outlier(np.array(self.log["loss"]))))
+            ax.plot(self.log["loss"])
             ax.set_title("Training Loss")
             ax.set_xlabel("Epoch #")
             ax.set_ylabel("Loss")
         
     def plot_shift_proba(self, ax, logs={}):
         zero, pval, nsigma = self.compute_shift_proba()
-        self.log["shift_pval"].append(pval)
-        self.log["shift_nsigma"].append(nsigma)
+        self.log["shift0_pval"].append(pval)
+        self.log["shift0_nsigma"].append(nsigma)
         logs["zero"] = zero
-        logs["shift_pval"] = pval
-        logs["shift_nsigma"] = nsigma
+        logs["shift0_pval"] = pval
+        logs["shift0_nsigma"] = nsigma
         if ax is not None:
-            ax.plot(self.log["shift_nsigma"])
-            # ax.set_title("Shift probability")
-            ax.set_title("Shift significance ($\sigma$)")
+            ax.plot(self.log["shift0_nsigma"])
+            ax.set_title("Zero-shift significance ($\sigma$)")
             ax.set_xlabel("Epoch #")
-            # ax.set_ylabel("Probability")
             ax.set_ylabel("$\sigma$")
-            # ax.set_yscale("logit")
 
     def plot_chi2_dist(self, ax, logs={}):
         chi2Z = np.sum(np.array(self.Z2Y_bijector.inverse(self.Y))**2, axis=1)
         _s = np.isfinite(chi2Z)
         chi2Z = chi2Z[_s]
         try:
-            chi2Z_ks, chi2Z_ks_p = scipy.stats.kstest(chi2Z, 'chi2', args=(self.n,))
+            chi2Z_ks, chi2Z_ks_p = scipy.stats.kstest(chi2Z, 'chi2', args=(self.num_params,))
         except:
             chi2Z_ks, chi2Z_ks_p = 0., 0.
 
-        xx = np.linspace(0, self.n*4, 1000)
-        bins = np.linspace(0, self.n*4, 100)
+        xx = np.linspace(0, self.num_params*4, 1000)
+        bins = np.linspace(0, self.num_params*4, 100)
         if ax is not None:
-            ax.plot(xx, scipy.stats.chi2.pdf(xx, df=self.n), label='$\chi^2_{{{}}}$ PDF'.format(self.n), c='k', lw=1)
+            ax.plot(xx, scipy.stats.chi2.pdf(xx, df=self.num_params), label='$\chi^2_{{{}}}$ PDF'.format(self.num_params), c='k', lw=1)
             ax.hist(self.chi2Y, bins=bins, density=True, histtype='step', color='orange', weights=self.weights, label='Pre-gauss ($D_n$={:.3f})'.format(self.chi2Y_ks)); #, $p$={:.3f})'.format(self.chi2Y_ks, self.chi2Y_ks_p));
             ax.hist(chi2Z, bins=bins, density=True, histtype='step', color='dodgerblue', weights=self.weights[_s], label='Post-gauss ($D_n$={:.3f})'.format(chi2Z_ks)); #, $p$={:.3f})'.format(chi2Z_ks, chi2Z_ks_p));
-            ax.set_title('$\chi^2_{{{}}}$ PDF'.format(self.n))
+            ax.set_title('$\chi^2_{{{}}}$ PDF'.format(self.num_params))
             ax.set_xlabel('$\chi^2$')
             ax.legend(fontsize=8)
 
     def on_epoch_end(self, epoch, logs={}):
-        if self.make_plots:
-            if isinstance(self.make_plots,int):
-                if epoch % self.make_plots:
+        if self.feedback:
+            if isinstance(self.feedback,int):
+                if epoch % self.feedback:
                     return
             clear_output(wait=True)
             fig, axes = plt.subplots(1,3,figsize=(12,3))
@@ -898,7 +968,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
 
 
 
-def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.leaky_relu, permutations=True, learning_rate=1e-4, feedback=0, **kwargs):
+def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.leaky_relu, permutations=True, feedback=0, **kwargs):
     """[summary]
 
     :param num_params: [description]
@@ -937,71 +1007,23 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
     for i in range(n_maf):
         if _permutations:
             bijectors.append(tfb.Permute(_permutations[i]))
-        made = tfb.AutoregressiveNetwork(params=2, event_shape=event_shape, hidden_units=hidden_units, activation=activation,
-                                         kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.01, seed=None), 
-                                         bias_initializer='zeros')
+        made = tfb.AutoregressiveNetwork(params=2, event_shape=event_shape, hidden_units=hidden_units, activation=activation, **kwargs)
         bijectors.append(tfb.MaskedAutoregressiveFlow(shift_and_log_scale_fn=made))
         
     bijector = tfb.Chain(bijectors)
-    transf_dist = tfd.TransformedDistribution(
-        distribution=tfd.MultivariateNormalDiag(np.zeros(num_params, dtype=np.float32), np.ones(num_params, dtype=np.float32)),
-        bijector=bijector)
-
-    # Construct model
-    x_ = Input(shape=event_shape, dtype=tf.float32)
-    log_prob_ = transf_dist.log_prob(x_)
-    # log_prob_ = tf.where(tf.math.is_finite(log_prob_), log_prob_, tf.zeros_like(log_prob_))
-    model = Model(x_, log_prob_)
-    
-    # Compile with log_prob loss
-    model.compile(optimizer=tf.optimizers.Adam(learning_rate=learning_rate), loss=lambda _, log_prob: -tf.reduce_mean(tf.boolean_mask(log_prob, tf.math.is_finite(log_prob))))
     
     if feedback>0:
         print("Building MAF")
-        print("    - trainable parameters:", model.count_params())
+        print("    - number of MAFs:", n_maf)
+        # print("    - trainable parameters:", model.count_params())
         print("    - activation:", activation)
         print("    - hidden_units:", hidden_units)
 
-    return transf_dist, model
+    return bijector
 
 
-
-def flow_parameter_shift(diff_chain, param_names=None,
-                         feedback=1, **kwargs):
-    """
-    Notations:
-        - X designates samples in the original parameter difference space;
-        - Y designates samples in the gaussian approximation space, computed from mean(X) and cov(X);
-        - Z designates samples in the gaussianized space, connected to Y with a normalizing flow, with Z~N(0,1).
-    """
-    
-    # initialize param names:
-    if param_names is None:
-        param_names = diff_chain.getParamNames().getRunningNames()
-    else:
-        chain_params = diff_chain.getParamNames().list()
-        if not np.all([name in chain_params for name in param_names]):
-            raise ValueError('Input parameter is not in the diff chain.\n',
-                             'Input parameters ', param_names, '\n'
-                             'Possible parameters', chain_params)
-    
-    # indexes:
-    ind = [diff_chain.index[name] for name in param_names]
-    num_params = len(ind)
-    
-    # Gaussian approximation
-    mcsamples_gaussian_approx = gaussian_tension.gaussian_approximation(diff_chain, param_names=param_names)
-    dist_gaussian_approx = tfd.MultivariateNormalTriL(loc=mcsamples_gaussian_approx.means[0].astype(np.float32), scale_tril=tf.linalg.cholesky(mcsamples_gaussian_approx.covs[0].astype(np.float32)))
-    
-    # MAF
-    transformed_distribution, model = _build_dist_maf(num_params, feedback=feedback, **kwargs)
-
-    # Samples
-    X = diff_chain.samples[:,ind]
-
-    weights = diff_chain.weights
-
+def flow_parameter_shift(diff_chain, param_names=None, **kwargs):    
     # Callback/model handler
-    diff_flow_callback = DiffFlowCallback(X, weights, model, dist_gaussian_approx, transformed_distribution, feedback=feedback, **kwargs)
+    diff_flow_callback = DiffFlowCallback(diff_chain, param_names=param_names, **kwargs)
 
-    return diff_flow_callback
+    diff_flow_callback.train()
