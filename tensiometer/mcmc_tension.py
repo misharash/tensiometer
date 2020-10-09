@@ -765,7 +765,7 @@ from matplotlib import pyplot as plt
 from collections.abc import Iterable
 
 class DiffFlowCallback(tf.keras.callbacks.Callback):
-    def __init__(self, X, model, dist_gaussian_approx, dist_transformed, feedback=1, make_plots=True, **kwargs):
+    def __init__(self, X, weights, model, dist_gaussian_approx, dist_transformed, feedback=1, make_plots=True, **kwargs):
         # Model
         self.model = model
 
@@ -779,15 +779,24 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         self.Z2X_bijector = tfb.Chain([self.Y2X_bijector, self.Z2Y_bijector])
 
         # Data
+        self.weights = weights
         self.X = X
         self.Y = np.array(self.Y2X_bijector.inverse(self.X))
         assert not np.any(np.isnan(self.Y))
         self.n = self.Y.shape[1]
 
+        Y_ds = tf.data.Dataset.from_tensor_slices((self.Y.astype(np.float32), np.zeros(self.Y.shape[0], dtype=np.float32), self.weights * len(self.weights) / np.sum(self.weights),))
+        Y_ds = Y_ds.prefetch(tf.data.experimental.AUTOTUNE)
+        Y_ds = Y_ds.cache()
+        # Y_ds = Y_ds.shuffle(self.n)
+        # Y_ds = Y_ds.batch(BATCH_SIZE)
+        self.Y_ds = Y_ds
+
+        # Full distribution
         self.dist_learned = tfd.TransformedDistribution(distribution=tfd.MultivariateNormalDiag(np.zeros(self.n, dtype=np.float32), np.ones(self.n, dtype=np.float32)), bijector=self.Z2X_bijector) # samples from std gaussian mapped to X
 
         # Metrics
-        keys = ["loss", "shift_proba"]
+        keys = ["loss", "shift_pval", "shift_nsigma"]
         self.log = {_k:[] for _k in keys}
 
         self.chi2Y = np.sum(self.Y**2, axis=1)
@@ -798,21 +807,33 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         self.feedback = feedback
     
     def train(self, batch_size=256, epochs=100, steps_per_epoch=32, callbacks=[], verbose=1, **kwargs):
-        self.model.fit(x=self.Y, y=np.zeros(self.Y.shape[0], dtype=np.float32),
+        _Y_ds = self.Y_ds.shuffle(self.n, reshuffle_each_iteration=True).repeat().batch(batch_size)
+
+        # self.model.fit(x=self.Y_ds, y=np.zeros(self.Y.shape[0], dtype=np.float32),
+        hist = self.model.fit(x=_Y_ds,
                         batch_size=batch_size,
                         epochs=epochs,
-                        # sample_weight=diff_chain.weights, # NOT YET SUPPORTED (maybe resample chain)
+                        # sample_weight=self.weights * len(self.weights) / np.sum(self.weights), #diff_chain.weights, # NOT YET SUPPORTED (maybe resample chain)
                         steps_per_epoch=steps_per_epoch, 
                         shuffle=True,
                         verbose=verbose,
                         callbacks=[tf.keras.callbacks.TerminateOnNaN(), self]+callbacks,
                         **kwargs)
+
+        return hist
+
+    # def sample_learned_dist(self, N, return_chain=True):
+    #     samples = np.array(flow_callback.dist_learned.sample(10000))
+    #     if return_chain
+    #         return MCSamples(samples=samples, names=[_x.name for _x in diff_chain.paramNames.names], labels=diff_chain.paramNames.labels(), label='learned')
     
     def compute_shift_proba(self):
-        chi2Z0 = np.sum(np.array(self.Z2X_bijector.inverse(np.zeros(self.n, dtype=np.float32)))**2)
+        zero = np.array(self.Z2X_bijector.inverse(np.zeros(self.n, dtype=np.float32)))
+        chi2Z0 = np.sum(zero**2)
         # return scipy.stats.chi2.cdf(chi2Z0, df=self.n)
         pval = scipy.stats.chi2.cdf(chi2Z0, df=self.n)
-        return utils.from_confidence_to_sigma(pval)
+        nsigma = utils.from_confidence_to_sigma(pval)
+        return zero, pval, nsigma
 
     def plot_loss(self, ax, logs={}):
         self.log["loss"].append(logs.get('loss'))
@@ -823,10 +844,14 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
             ax.set_ylabel("Loss")
         
     def plot_shift_proba(self, ax, logs={}):
-        shift_proba = self.compute_shift_proba()
-        self.log["shift_proba"].append(shift_proba)
+        zero, pval, nsigma = self.compute_shift_proba()
+        self.log["shift_pval"].append(pval)
+        self.log["shift_nsigma"].append(nsigma)
+        logs["zero"] = zero
+        logs["shift_pval"] = pval
+        logs["shift_nsigma"] = nsigma
         if ax is not None:
-            ax.plot(self.log["shift_proba"])
+            ax.plot(self.log["shift_nsigma"])
             # ax.set_title("Shift probability")
             ax.set_title("Shift significance ($\sigma$)")
             ax.set_xlabel("Epoch #")
@@ -836,7 +861,8 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
 
     def plot_chi2_dist(self, ax, logs={}):
         chi2Z = np.sum(np.array(self.Z2Y_bijector.inverse(self.Y))**2, axis=1)
-        chi2Z = chi2Z[np.isfinite(chi2Z)]
+        _s = np.isfinite(chi2Z)
+        chi2Z = chi2Z[_s]
         try:
             chi2Z_ks, chi2Z_ks_p = scipy.stats.kstest(chi2Z, 'chi2', args=(self.n,))
         except:
@@ -846,19 +872,21 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         bins = np.linspace(0, self.n*4, 100)
         if ax is not None:
             ax.plot(xx, scipy.stats.chi2.pdf(xx, df=self.n), label='$\chi^2_{{{}}}$ PDF'.format(self.n), c='k', lw=1)
-            ax.hist(self.chi2Y, bins=bins, density=True, histtype='step', color='orange', label='Pre-gauss ($D_n$={:.3f})'.format(self.chi2Y_ks)); #, $p$={:.3f})'.format(self.chi2Y_ks, self.chi2Y_ks_p));
-            ax.hist(chi2Z, bins=bins, density=True, histtype='step', color='dodgerblue', label='Post-gauss ($D_n$={:.3f})'.format(chi2Z_ks)); #, $p$={:.3f})'.format(chi2Z_ks, chi2Z_ks_p));
-            ax.set_title('$\chi^2_{}$ PDF'.format(self.n))
+            ax.hist(self.chi2Y, bins=bins, density=True, histtype='step', color='orange', weights=self.weights, label='Pre-gauss ($D_n$={:.3f})'.format(self.chi2Y_ks)); #, $p$={:.3f})'.format(self.chi2Y_ks, self.chi2Y_ks_p));
+            ax.hist(chi2Z, bins=bins, density=True, histtype='step', color='dodgerblue', weights=self.weights[_s], label='Post-gauss ($D_n$={:.3f})'.format(chi2Z_ks)); #, $p$={:.3f})'.format(chi2Z_ks, chi2Z_ks_p));
+            ax.set_title('$\chi^2_{{{}}}$ PDF'.format(self.n))
             ax.set_xlabel('$\chi^2$')
             ax.legend(fontsize=8)
 
     def on_epoch_end(self, epoch, logs={}):
         if self.make_plots:
+            if isinstance(self.make_plots,int):
+                if epoch % self.make_plots:
+                    return
             clear_output(wait=True)
             fig, axes = plt.subplots(1,3,figsize=(12,3))
         else:
-            axes = [None]*4
-
+            axes = [None]*3        
 
         self.plot_loss(axes[0], logs=logs)
         self.plot_shift_proba(axes[1], logs=logs)
@@ -909,7 +937,9 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
     for i in range(n_maf):
         if _permutations:
             bijectors.append(tfb.Permute(_permutations[i]))
-        made = tfb.AutoregressiveNetwork(params=2, event_shape=event_shape, hidden_units=hidden_units, activation=activation)
+        made = tfb.AutoregressiveNetwork(params=2, event_shape=event_shape, hidden_units=hidden_units, activation=activation,
+                                         kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.01, seed=None), 
+                                         bias_initializer='zeros')
         bijectors.append(tfb.MaskedAutoregressiveFlow(shift_and_log_scale_fn=made))
         
     bijector = tfb.Chain(bijectors)
@@ -920,10 +950,11 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
     # Construct model
     x_ = Input(shape=event_shape, dtype=tf.float32)
     log_prob_ = transf_dist.log_prob(x_)
+    # log_prob_ = tf.where(tf.math.is_finite(log_prob_), log_prob_, tf.zeros_like(log_prob_))
     model = Model(x_, log_prob_)
     
     # Compile with log_prob loss
-    model.compile(optimizer=tf.optimizers.Adam(learning_rate=learning_rate), loss=lambda _, log_prob: -log_prob,)
+    model.compile(optimizer=tf.optimizers.Adam(learning_rate=learning_rate), loss=lambda _, log_prob: -tf.reduce_mean(tf.boolean_mask(log_prob, tf.math.is_finite(log_prob))))
     
     if feedback>0:
         print("Building MAF")
@@ -968,7 +999,9 @@ def flow_parameter_shift(diff_chain, param_names=None,
     # Samples
     X = diff_chain.samples[:,ind]
 
+    weights = diff_chain.weights
+
     # Callback/model handler
-    diff_flow_callback = DiffFlowCallback(X, model, dist_gaussian_approx, transformed_distribution, feedback=feedback, make_plots=True)
+    diff_flow_callback = DiffFlowCallback(X, weights, model, dist_gaussian_approx, transformed_distribution, feedback=feedback, **kwargs)
 
     return diff_flow_callback
