@@ -20,6 +20,7 @@ import tensiometer.utilities as utils
 import matplotlib.pyplot as plt
 
 diff_chain = parameter_diff_chain(chain_1, chain_2, boost=1)
+
 param_names = None
 scale = None
 method = 'brute_force'
@@ -33,6 +34,7 @@ n_threads = 1
 import os
 import time
 import gc
+from numba import jit
 import numpy as np
 import getdist.chains as gchains
 gchains.print_load_details = False
@@ -139,10 +141,10 @@ def parameter_diff_weighted_samples(samples_1, samples_2, boost=1,
         # compute weights (as the product of the weights):
         weights[ind*num_samps_1:(ind+1)*num_samps_1] = \
             ch1.weights*np.take(ch2.weights, _indexes, mode='wrap')
-        # compute the likelihood difference:
+        # compute the likelihood:
         if ch1.loglikes is not None and ch2.loglikes is not None:
             loglikes[ind*num_samps_1:(ind+1)*num_samps_1] = \
-                ch1.loglikes-np.take(ch2.loglikes, _indexes, mode='wrap')
+                ch1.loglikes+np.take(ch2.loglikes, _indexes, mode='wrap')
         # compute the difference samples:
         difference_samples[ind*num_samps_1:(ind+1)*num_samps_1, :] = \
             ch1.samples[:, ind1] \
@@ -370,12 +372,93 @@ def OptimizeBandwidth_1D(diff_chain, param_names=None, num_bins=1000):
                                                kernel_order=0) \
             * (binmax - binmin)
         # correction for dimensionality:
-        dim_factor = Silvermans_RT(_num_params, N_eff)/Silvermans_RT(1., N_eff)
         dim_factor = Scotts_RT(_num_params, N_eff)/Scotts_RT(1., N_eff)
         #
         bands.append(band**2.*dim_factor)
     #
     return np.array(bands)
+
+
+def OptimizeBandwidth_1D_2(diff_chain, param_names=None):
+
+    if param_names is None:
+        param_names = diff_chain.getParamNames().getRunningNames()
+    else:
+        chain_params = diff_chain.getParamNames().list()
+        if not np.all([name in chain_params for name in param_names]):
+            raise ValueError('Input parameter is not in the diff chain.\n',
+                             'Input parameters ', param_names, '\n'
+                             'Possible parameters', chain_params)
+    # indexes:
+    ind = [diff_chain.index[name] for name in param_names]
+    # some initial calculations:
+    _samples_cov = diff_chain.cov(pars=param_names)
+    _num_params = len(ind)
+    # whiten the samples:
+    _temp = sqrtm(utils.QR_inverse(_samples_cov))
+    white_samples = diff_chain.samples[:, ind].dot(_temp)
+    weights = diff_chain.weights
+
+    # define cross validation likelihood
+    @jit(nopython=True, fastmath=True)
+    def cross_validation_dummy_diag(beta, weights, white_samples):
+        # digest:
+        n, num_params = white_samples.shape
+        # duplicate and differently whighten the samples:
+        _temp = np.identity(num_params)/beta
+        white_samples_h = white_samples.dot(_temp)
+        # pre calculations:
+        fac2 = 2**(-0.5*num_params)
+        sum_w = np.sum(weights)
+        # acumulate the result:
+        res = 0.
+        for i in range(n):
+            for j in range(n):
+                if j != i:
+                    samp_1 = white_samples_h[i]-white_samples_h[j]
+                    r2 = np.dot(samp_1, samp_1)
+                    temp = fac2*np.exp(-0.25*r2) - 2.*np.exp(-0.5*r2)
+                    temp = weights[i]*weights[j]*temp
+                    res += temp/(sum_w - weights[j])
+        res = (res + fac2)*beta**(-num_params/2.)
+        return res/sum_w
+
+
+
+    beta = np.logspace(-2, 2.0, 200)
+
+    y = np.array([cross_validation_dummy_diag(b, weights[:1000], white_samples[:1000,:]) for b in beta])
+
+    n, num_params = white_samples.shape
+    Silvermans_RT(num_params, np.sum(weights[:1000]))
+    Scotts_RT(num_params, np.sum(weights[:1000]))
+
+
+    beta[np.argmax(y)]
+    beta[np.argmin(y)]
+    np.log10(beta[np.argmin(y)])
+
+
+    plt.plot(np.log10(beta), np.abs(y))
+    plt.yscale('log')
+
+    plt.plot(np.log10(beta), np.log(y**2))
+
+
+    plt.plot(np.log10(beta[1:]), np.log(np.abs(y[:-1]-y[1:])))
+
+
+
+
+
+    pass
+
+
+
+
+
+
+
 
 ###############################################################################
 # Parameter difference integrals:
@@ -804,7 +887,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
 
         # Options
         self.feedback = feedback
-        
+
         # Pre-gaussianization
         if pregauss_bijector is not None:
             # The idea is to introduce yet another step of deterministic gaussianization, eg using the prior CDF
@@ -821,11 +904,11 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
                 raise ValueError('Input parameter is not in the diff chain.\n',
                                 'Input parameters ', param_names, '\n'
                                 'Possible parameters', chain_params)
-        
+
         # indexes:
         ind = [diff_chain.index[name] for name in param_names]
         self.num_params = len(ind)
-        
+
         # Gaussian approximation
         mcsamples_gaussian_approx = gaussian_tension.gaussian_approximation(diff_chain, param_names=param_names)
         self.dist_gaussian_approx = tfd.MultivariateNormalTriL(loc=mcsamples_gaussian_approx.means[0].astype(np.float32), scale_tril=tf.linalg.cholesky(mcsamples_gaussian_approx.covs[0].astype(np.float32)))
@@ -858,7 +941,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         hist = self.model.fit(x=self.Y_ds.batch(batch_size),
                         batch_size=batch_size,
                         epochs=epochs,
-                        steps_per_epoch=steps_per_epoch, 
+                        steps_per_epoch=steps_per_epoch,
                         verbose=verbose,
                         callbacks=[tf.keras.callbacks.TerminateOnNaN(), self]+callbacks,
                         **kwargs)
@@ -879,12 +962,12 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         while err>tol and counter>=0:
             _s = self.dist_learned.sample(step)
             res += list(np.array(self.dist_learned.log_prob(_s) > _thres))
-            
+
             r = np.array(res)
             k = np.sum(r)
             N = len(r)
             p = float(k)/N
-    
+
             if k==0:
                 continue
 
@@ -899,7 +982,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
 
         return p, utils.from_confidence_to_sigma(p)
 
-    
+
     def compute_shift_proba(self):
         zero = np.array(self.Z2X_bijector.inverse(np.zeros(self.num_params, dtype=np.float32)))
         chi2Z0 = np.sum(zero**2)
@@ -915,7 +998,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
             ax.set_title("Training Loss")
             ax.set_xlabel("Epoch #")
             ax.set_ylabel("Loss")
-        
+
     def plot_shift_proba(self, ax, logs={}):
         zero, pval, nsigma = self.compute_shift_proba()
         self.log["shift0_pval"].append(pval)
@@ -956,7 +1039,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
             clear_output(wait=True)
             fig, axes = plt.subplots(1,3,figsize=(12,3))
         else:
-            axes = [None]*3        
+            axes = [None]*3
 
         self.plot_loss(axes[0], logs=logs)
         self.plot_shift_proba(axes[1], logs=logs)
@@ -964,7 +1047,7 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
 
         plt.tight_layout()
         plt.show()
-    
+
 
 
 
@@ -987,7 +1070,7 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
     if n_maf is None:
         n_maf = 2*num_params
     event_shape = (num_params,)
-    
+
     if hidden_units is None:
         hidden_units = [num_params*2]*2
 
@@ -1009,9 +1092,9 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
             bijectors.append(tfb.Permute(_permutations[i]))
         made = tfb.AutoregressiveNetwork(params=2, event_shape=event_shape, hidden_units=hidden_units, activation=activation, **kwargs)
         bijectors.append(tfb.MaskedAutoregressiveFlow(shift_and_log_scale_fn=made))
-        
+
     bijector = tfb.Chain(bijectors)
-    
+
     if feedback>0:
         print("Building MAF")
         print("    - number of MAFs:", n_maf)
@@ -1022,7 +1105,7 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
     return bijector
 
 
-def flow_parameter_shift(diff_chain, param_names=None, **kwargs):    
+def flow_parameter_shift(diff_chain, param_names=None, **kwargs):
     # Callback/model handler
     diff_flow_callback = DiffFlowCallback(diff_chain, param_names=param_names, **kwargs)
 
