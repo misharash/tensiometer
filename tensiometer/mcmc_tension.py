@@ -423,43 +423,6 @@ def OptimizeBandwidth_1D_2(diff_chain, param_names=None):
         res = (res + fac2)*beta**(-num_params/2.)
         return res/sum_w
 
-
-
-    beta = np.logspace(-2, 2.0, 200)
-
-    y = np.array([cross_validation_dummy_diag(b, weights[:1000], white_samples[:1000,:]) for b in beta])
-
-    n, num_params = white_samples.shape
-    Silvermans_RT(num_params, np.sum(weights[:1000]))
-    Scotts_RT(num_params, np.sum(weights[:1000]))
-
-
-    beta[np.argmax(y)]
-    beta[np.argmin(y)]
-    np.log10(beta[np.argmin(y)])
-
-
-    plt.plot(np.log10(beta), np.abs(y))
-    plt.yscale('log')
-
-    plt.plot(np.log10(beta), np.log(y**2))
-
-
-    plt.plot(np.log10(beta[1:]), np.log(np.abs(y[:-1]-y[1:])))
-
-
-
-
-
-    pass
-
-
-
-
-
-
-
-
 ###############################################################################
 # Parameter difference integrals:
 
