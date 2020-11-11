@@ -39,22 +39,22 @@ class test_mcmc_shift(unittest.TestCase):
     # test that different exact methods give the same result:
     def test_from_confidence_to_sigma_result(self):
         # get brute force resuls:
-        res_1 = mt.exact_parameter_shift(self.diff_chain,
+        res_1 = mt.kde_parameter_shift(self.diff_chain,
                                          method='brute_force',
                                          scale=0.5)
         # get nearest elimination results:
-        res_2 = mt.exact_parameter_shift(self.diff_chain,
+        res_2 = mt.kde_parameter_shift(self.diff_chain,
                                          method='nearest_elimination',
                                          scale=0.5)
         print(res_1, res_2)
         assert np.allclose(res_1, res_2)
         # now with high feedback:
-        res_3 = mt.exact_parameter_shift(self.diff_chain,
+        res_3 = mt.kde_parameter_shift(self.diff_chain,
                                          method='brute_force',
                                          feedback=2,
                                          scale=0.5)
         assert np.allclose(res_1, res_3)
-        res_4 = mt.exact_parameter_shift(self.diff_chain,
+        res_4 = mt.kde_parameter_shift(self.diff_chain,
                                          method='nearest_elimination',
                                          feedback=2,
                                          scale=0.5)
@@ -63,12 +63,12 @@ class test_mcmc_shift(unittest.TestCase):
         assert np.allclose(res_3, res_4)
         # now with given parameter names:
         param_names = ['delta_omegam', 'delta_sigma8']
-        res_1 = mt.exact_parameter_shift(self.diff_chain,
+        res_1 = mt.kde_parameter_shift(self.diff_chain,
                                          param_names=param_names,
                                          method='brute_force',
                                          scale=0.5)
         # get nearest elimination results:
-        res_2 = mt.exact_parameter_shift(self.diff_chain,
+        res_2 = mt.kde_parameter_shift(self.diff_chain,
                                          param_names=param_names,
                                          method='nearest_elimination',
                                          scale=0.5)

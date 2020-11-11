@@ -7,3 +7,5 @@ coverage
 tqdm
 autograd
 pymanopt
+tensorflow=1.15
+tensorflow_probability

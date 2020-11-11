@@ -130,16 +130,16 @@ class test_PDM_vectorization(unittest.TestCase):
             for i in range(10):
                 vec = 2.*np.random.rand(num) -1.
                 # get the corresponding PDM matrix:
-                mat = vector_to_PDM(vec, d)
+                mat = ttu.vector_to_PDM(vec)
                 # check that it is positive definite:
                 assert np.all(np.linalg.eig(mat)[0] > 0)
                 # transform back. This can be different from the previous one
                 # because of many discrete symmetries in defining the
                 # eigenvectors
-                vec2 = PDM_to_vector(mat, d)
+                vec2 = ttu.PDM_to_vector(mat)
                 # transform again. This has to be equal, discrete symmetries for
                 # eigenvectors do not matter once they are paired with eigenvalues:
-                mat2 = vector_to_PDM(vec2, d)
+                mat2 = ttu.vector_to_PDM(vec2)
                 assert np.allclose(mat, mat2)
 
     # test raises:

@@ -20,6 +20,7 @@ import tensiometer.utilities as utils
 import matplotlib.pyplot as plt
 
 diff_chain = parameter_diff_chain(chain_1, chain_2, boost=1)
+num_params, num_samples = diff_chain.samples.T.shape
 
 param_names = None
 scale = None
@@ -39,8 +40,10 @@ import numpy as np
 import getdist.chains as gchains
 gchains.print_load_details = False
 from getdist import MCSamples, WeightedSamples
+import scipy
 from scipy.linalg import sqrtm
 from scipy.integrate import simps
+from scipy.spatial import cKDTree
 
 from . import utilities as utils
 
@@ -52,6 +55,12 @@ if 'OMP_NUM_THREADS' in os.environ.keys():
     n_threads = int(os.environ['OMP_NUM_THREADS'])
 else:
     n_threads = multiprocessing.cpu_count()
+
+# imports for manifold optimization:
+import autograd.numpy as anp
+from pymanopt.manifolds import PositiveDefinite, PSDFixedRank, Elliptope
+from pymanopt import Problem
+import pymanopt.solvers
 
 ###############################################################################
 # Parameter difference chain:
@@ -296,20 +305,32 @@ def parameter_diff_chain(chain_1, chain_2, boost=1):
 # KDE bandwidth selection:
 
 
-def Scotts_RT(num_params, num_samples):
+def _helper_whiten_samples(samples, weights):
+    """
+    """
+    # compute sample covariance:
+    _cov = np.cov(samples.T, aweights=weights)
+    # compute its inverse square root:
+    _temp = sqrtm(utils.QR_inverse(_cov))
+    # whiten the samples:
+    white_samples = samples.dot(_temp)
+    #
+    return white_samples
+
+
+def Scotts_bandwidth(num_params, num_samples):
     """
     Compute Scott's rule of thumb bandwidth covariance scaling.
-    This is the default scaling that is used to compute the KDE estimate of
-    parameter shifts.
+    This should be a fast approximation of the 1d MISE estimate.
 
     :param num_params: the number of parameters in the chain.
     :param num_samples: the number of samples in the chain.
     :return: Scott's scaling.
     """
-    return num_samples**(-2./(num_params+4.))
+    return num_samples**(-2./(num_params+4.)) * np.identity(int(num_params))
 
 
-def Silvermans_RT(num_params, num_samples):
+def AMISE_bandwidth(num_params, num_samples):
     """
     Compute Silverman's rule of thumb bandwidth covariance scaling.
     This is the default scaling that is used to compute the KDE estimate of
@@ -319,7 +340,203 @@ def Silvermans_RT(num_params, num_samples):
     :param num_samples: the number of samples in the chain.
     :return: Silverman's scaling.
     """
-    return (num_samples * (num_params + 2.) / 4.)**(-2. / (num_params + 4.))
+    coeff = (num_samples * (num_params + 2.) / 4.)**(-2. / (num_params + 4.))
+    return coeff * np.identity(int(num_params))
+
+
+def MAX_bandwidth(num_params, num_samples):
+    """
+    """
+    d, n = num_params, num_samples
+    coeff = (d + 8.)**((d + 6.) / (d + 4.)) / 4.
+    coeff = coeff*(1./n/(d + 2.)/scipy.special.gamma(d/2. + 4))**(2./(d + 4.))
+    return coeff*np.identity(int(num_params))
+
+
+@jit(nopython=True, fastmath=True)
+def _mise1d_optimizer(alpha, d, n):
+    """
+    """
+    tmp = 2**(-d/2.) - 2/(2 + alpha)**(d/2.) + (2 + 2*alpha)**(-d/2.) \
+        + (alpha**(-d/2.) - (1 + alpha)**(-d/2.))/(2**(d/2.)*n)
+    return tmp
+
+
+@jit(nopython=True, fastmath=True)
+def _mise1d_optimizer_jac(alpha, d, n):
+    """
+    """
+    tmp = d*(2 + alpha)**(-1 - d/2.) - d*(2 + 2*alpha)**(-1 - d/2.) \
+        + (2**(-1 - d/2.)*d*(-alpha**(-1 - d/2.)
+                             + (1 + alpha)**(-1 - d/2.)))/n
+    return tmp
+
+
+def MISE_bandwidth_1d(num_params, num_samples, **kwargs):
+    """
+    """
+    # initial calculations:
+    alpha0 = kwargs.pop('alpha0', None)
+    if alpha0 is None:
+        alpha0 = AMISE_bandwidth(num_params, num_samples)[0, 0]
+    d, n = num_params, num_samples
+    # explicit optimization:
+    opt = scipy.optimize.minimize(lambda alpha: _mise1d_optimizer(np.exp(alpha), d, n),
+                                  np.log(alpha0),
+                                  jac=lambda alpha: _mise1d_optimizer_jac(np.exp(alpha), d, n),
+                                  **kwargs)
+    # check for success:
+    if not opt.success:
+        print(opt)
+    #
+    return np.exp(opt.x[0]) * np.identity(num_params)
+
+
+def _mise_optimizer(H, d, n):
+    Id = anp.identity(d, dtype='float')
+    tmp = 1./anp.sqrt(anp.linalg.det(2.*H))/n
+    tmp = tmp + (1.-1./n)/anp.sqrt(anp.linalg.det(2.*H + 2.*Id)) \
+        - 2./anp.sqrt(anp.linalg.det(H + 2.*Id)) + anp.power(2., -d/2.)
+    return tmp
+
+
+def MISE_bandwidth(num_params, num_samples, **kwargs):
+    """
+    """
+    # initial calculations:
+    alpha0 = kwargs.pop('alpha0', None)
+    if alpha0 is None:
+        alpha0 = MISE_bandwidth_1d(num_params, num_samples)
+    d, n = num_params, num_samples
+    # initialize manifold:
+    manifold = PositiveDefinite(d, k=1)
+    problem = Problem(manifold=manifold,
+                      cost=lambda x: _mise_optimizer(x, d, n), **kwargs)
+    solver = pymanopt.solvers.TrustRegions(logverbosity=0)
+    Xopt = solver.solve(problem, x=alpha0)
+    #
+    return Xopt
+
+
+@jit(nopython=True, fastmath=True, parallel=True)
+def _UCV_optimizer(H, weights, white_samples):
+    """
+    Note this solves for sqrt(H)
+    """
+    # digest:
+    n, d = white_samples.shape
+    fac = 2**(-d/2.)
+    # compute the weights vectors:
+    wtot = np.sum(weights)
+    neff = wtot**2 / np.sum(weights**2)
+    alpha = wtot / (wtot - weights)
+    # compute determinant:
+    detH = np.linalg.det(H)
+    # whiten samples with inverse H:
+    samps = white_samples.dot(np.linalg.inv(H))
+    # brute force summation:
+    res = 0.
+    for i in range(1, n):
+        for j in range(i):
+            temp_samp = samps[i]-samps[j]
+            r2 = np.dot(temp_samp, temp_samp)
+            temp = fac*np.exp(-0.25*r2) - 2.*alpha[i]*np.exp(-0.5*r2)
+            res += weights[i]*weights[j]*temp
+    res = 2. * res / wtot**2
+    #
+    return (fac/neff + res)/detH
+
+
+def _UCV_optimizer(H, weights, white_samples, n_nearest=20):
+    """
+    Note this solves for sqrt(H) and uses a truncated KD-tree
+    """
+    # digest:
+    n, d = white_samples.shape
+    fac = 2**(-d/2.)
+    # compute the weights vectors:
+    wtot = np.sum(weights)
+    neff = wtot**2 / np.sum(weights**2)
+    alpha = wtot / (wtot - weights)
+    # compute determinant:
+    detH = np.linalg.det(H)
+    # whiten samples with inverse H:
+    samps = white_samples.dot(np.linalg.inv(H))
+    # KD-tree computation:
+    data_tree = cKDTree(samps, balanced_tree=True)
+    # query for nearest neighbour:
+    d, idx = data_tree.query(samps, np.arange(2, n_nearest), n_jobs=-1)
+    d = np.square(d)
+    temp = weights[:, None]*weights[idx]*(fac*np.exp(-0.25*d)
+                                          - 2.*np.exp(-0.5*d)*alpha[:, None])
+    res = np.sum(temp) / wtot**2
+    #
+    return (fac/neff + res)/detH
+
+
+def UCV_bandwidth_1d(weights, white_samples, **kwargs):
+    """
+    """
+    # digest input:
+    n, d = white_samples.shape
+    # get number of effective samples:
+    wtot = np.sum(weights)
+    neff = wtot**2 / np.sum(weights**2)
+    # initial guess calculations:
+    alpha0 = AMISE_bandwidth(d, neff)[0, 0]
+    # explicit optimization:
+    opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer(np.sqrt(np.exp(alpha)) * np.identity(d), weights, white_samples, **kwargs),
+                                  np.log(alpha0), **kwargs)
+    # check for success:
+    if not opt.success:
+        print(opt)
+    #
+    return np.sqrt(np.exp(opt.x[0])) * np.identity(d)
+
+
+def UCV_bandwidth_diag(weights, white_samples, **kwargs):
+    """
+    """
+    # digest input:
+    n, d = white_samples.shape
+    # get number of effective samples:
+    wtot = np.sum(weights)
+    neff = wtot**2 / np.sum(weights**2)
+    # initial guess calculations:
+    alpha0 = np.diag(AMISE_bandwidth(d, neff))
+    # explicit optimization:
+    opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer(np.diag(np.sqrt(np.exp(alpha))), weights, white_samples, **kwargs),
+                                  x0=np.log(alpha0), **kwargs)
+    # check for success:
+    if not opt.success:
+        print(opt)
+    #
+    return np.diag(np.sqrt(np.exp(opt.x)))
+
+
+def UCV_bandwidth(weights, white_samples, **kwargs):
+    """
+    """
+    # digest input:
+    n, d = white_samples.shape
+    # get number of effective samples:
+    wtot = np.sum(weights)
+    neff = wtot**2 / np.sum(weights**2)
+    # initial guess calculations:
+    alpha0 = PDM_to_vector(np.sqrt(AMISE_bandwidth(d, neff)), d)
+    # build a constraint:
+    bounds = kwargs.pop('bounds', None)
+    if bounds is None:
+        bounds = np.array([[None, None] for i in range(d*(d+1)//2)])
+        bounds[np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]] = [alpha0[0]/10, alpha0[0]*10]
+    # explicit optimization:
+    opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer(vector_to_PDM(alpha, d), weights, white_samples, **kwargs),
+                                  x0=alpha0, bounds=bounds, **kwargs)
+    # check for success:
+    if not opt.success:
+        print(opt)
+    #
+    return sqrtm(vector_to_PDM(opt.x, d))
 
 
 def OptimizeBandwidth_1D(diff_chain, param_names=None, num_bins=1000):
@@ -327,6 +544,7 @@ def OptimizeBandwidth_1D(diff_chain, param_names=None, num_bins=1000):
     Compute an estimate of an optimal bandwidth for covariance scaling as in
     GetDist. This is performed on whitened samples (with identity covariance),
     in 1D, and then scaled up with a dimensionality correction.
+    This is by no means optimal in any sense but might work
 
     :param diff_chain:
     :param param_names:
@@ -372,56 +590,11 @@ def OptimizeBandwidth_1D(diff_chain, param_names=None, num_bins=1000):
                                                kernel_order=0) \
             * (binmax - binmin)
         # correction for dimensionality:
-        dim_factor = Scotts_RT(_num_params, N_eff)/Scotts_RT(1., N_eff)
+        dim_factor = Scotts_bandwidth(_num_params, N_eff)[0,0]/Scotts_bandwidth(1., N_eff)[0,0]
         #
         bands.append(band**2.*dim_factor)
     #
     return np.array(bands)
-
-
-def OptimizeBandwidth_1D_2(diff_chain, param_names=None):
-
-    if param_names is None:
-        param_names = diff_chain.getParamNames().getRunningNames()
-    else:
-        chain_params = diff_chain.getParamNames().list()
-        if not np.all([name in chain_params for name in param_names]):
-            raise ValueError('Input parameter is not in the diff chain.\n',
-                             'Input parameters ', param_names, '\n'
-                             'Possible parameters', chain_params)
-    # indexes:
-    ind = [diff_chain.index[name] for name in param_names]
-    # some initial calculations:
-    _samples_cov = diff_chain.cov(pars=param_names)
-    _num_params = len(ind)
-    # whiten the samples:
-    _temp = sqrtm(utils.QR_inverse(_samples_cov))
-    white_samples = diff_chain.samples[:, ind].dot(_temp)
-    weights = diff_chain.weights
-
-    # define cross validation likelihood
-    @jit(nopython=True, fastmath=True)
-    def cross_validation_dummy_diag(beta, weights, white_samples):
-        # digest:
-        n, num_params = white_samples.shape
-        # duplicate and differently whighten the samples:
-        _temp = np.identity(num_params)/beta
-        white_samples_h = white_samples.dot(_temp)
-        # pre calculations:
-        fac2 = 2**(-0.5*num_params)
-        sum_w = np.sum(weights)
-        # acumulate the result:
-        res = 0.
-        for i in range(n):
-            for j in range(n):
-                if j != i:
-                    samp_1 = white_samples_h[i]-white_samples_h[j]
-                    r2 = np.dot(samp_1, samp_1)
-                    temp = fac2*np.exp(-0.25*r2) - 2.*np.exp(-0.5*r2)
-                    temp = weights[i]*weights[j]*temp
-                    res += temp/(sum_w - weights[j])
-        res = (res + fac2)*beta**(-num_params/2.)
-        return res/sum_w
 
 ###############################################################################
 # Parameter difference integrals:
@@ -437,19 +610,8 @@ def _gauss_kde_pdf(x, samples, weights):
     return np.log(np.dot(weights, np.exp(-0.5*(X*X).sum(axis=1))))
 
 
-def _epa_kde_pdf(x, samples, weights):
-    """
-    Utility function to compute the Epanechnikov log KDE probability at x from
-    already whitened samples, possibly with weights.
-    Normalization constants are ignored.
-    """
-    X = x-samples
-    X2 = (X*X).sum(axis=1)
-    return np.log(np.dot(weights[X2 < 1.], 1.-X2[X2 < 1.]))
-
-
 def _brute_force_parameter_shift(white_samples, weights, zero_prob,
-                                 num_samples, feedback, kernel='Gaussian'):
+                                 num_samples, feedback):
     """
     Brute force parallelized algorithm for parameter shift.
     """
@@ -460,12 +622,7 @@ def _brute_force_parameter_shift(white_samples, weights, zero_prob,
     else:
         def feedback_helper(x): return x
     # select kernel:
-    if kernel is None or kernel == 'Gaussian':
-        log_kernel = _gauss_kde_pdf
-    elif kernel == 'Epa':
-        log_kernel = _epa_kde_pdf
-    else:
-        raise ValueError('Unknown kernel given')
+    log_kernel = _gauss_kde_pdf
     # run:
     with joblib.Parallel(n_jobs=n_threads) as parallel:
         _kde_eval_pdf = parallel(joblib.delayed(log_kernel)
@@ -481,8 +638,9 @@ def _brute_force_parameter_shift(white_samples, weights, zero_prob,
 
 def _nearest_parameter_shift(white_samples, weights, zero_prob, num_samples,
                              feedback, **kwargs):
+    """
+    """
     # import specific for this function:
-    from scipy.spatial import cKDTree
     if feedback > 1:
         from tqdm import tqdm
         def feedback_helper(x): return tqdm(x, ascii=True)
@@ -556,11 +714,96 @@ def _nearest_parameter_shift(white_samples, weights, zero_prob, num_samples,
     return _num_filtered
 
 
-def exact_parameter_shift_2D_fft(diff_chain, param_names=None,
-                                 scale=None, nbins=1024, feedback=1,
-                                 boundary_correction_order=1,
-                                 mult_bias_correction_order=1,
-                                 **kwarks):
+def kde_parameter_shift_1D_fft(diff_chain, param_names=None,
+                               scale=None, nbins=1024, feedback=1,
+                               boundary_correction_order=1,
+                               mult_bias_correction_order=1,
+                               **kwarks):
+    """
+    Compute the MCMC estimate of the probability of a parameter shift given
+    an input parameter difference chain in 2 dimensions and by using FFT.
+    This function uses GetDist 2D fft and optimal bandwidth estimates to
+    perform the MCMC parameter shift integral discussed in
+    (`Raveri, Zacharegkas and Hu 19 <https://arxiv.org/pdf/1912.04880.pdf>`_).
+
+    :param diff_chain: :class:`~getdist.mcsamples.MCSamples`
+        input parameter difference chain
+    :param param_names: (optional) parameter names of the parameters to be used
+        in the calculation. By default all running parameters.
+    :param scale: (optional) scale for the KDE smoothing.
+        If none is provided the algorithm uses GetDist optimized bandwidth.
+    :param nbins: (optional) number of 2D bins for the fft.
+        Default is 1024.
+    :param mult_bias_correction_order: (optional) multiplicative bias
+        correction passed to GetDist.
+        See :meth:`~getdist.mcsamples.MCSamples.get2DDensity`.
+    :param boundary_correction_order: (optional) boundary correction
+        passed to GetDist.
+        See :meth:`~getdist.mcsamples.MCSamples.get2DDensity`.
+    :param feedback: (optional) print to screen the time taken
+        for the calculation.
+    :return: probability value and error estimate.
+    """
+    # initialize param names:
+    if param_names is None:
+        param_names = diff_chain.getParamNames().getRunningNames()
+    else:
+        chain_params = diff_chain.getParamNames().list()
+        if not np.all([name in chain_params for name in param_names]):
+            raise ValueError('Input parameter is not in the diff chain.\n',
+                             'Input parameters ', param_names, '\n'
+                             'Possible parameters', chain_params)
+    # check that we only have two parameters:
+    if len(param_names) != 1:
+        raise ValueError('Calling 1D algorithm with more than 1 parameters')
+    # initialize scale:
+    if scale is None or isinstance(scale, str):
+        scale = -1
+    # indexes:
+    ind = [diff_chain.index[name] for name in param_names]
+    # compute the density with GetDist:
+    t0 = time.time()
+    density = diff_chain.get1DDensity(name=ind[0], normalized=True,
+                                      num_bins=nbins,
+                                      smooth_scale_1D=scale,
+                                      boundary_correction_order=boundary_correction_order,
+                                      mult_bias_correction_order=mult_bias_correction_order)
+    # initialize the spline:
+    density._initSpline()
+    # get density of zero:
+    prob_zero = density.Prob([0.])[0]
+    # do the MC integral:
+    probs = density.Prob(diff_chain.samples[:, ind[0]])
+    # filter:
+    _filter = probs > prob_zero
+    # if there are samples above zero then use MC:
+    if np.sum(_filter) > 0:
+        _num_filtered = float(np.sum(diff_chain.weights[_filter]))
+        _num_samples = float(np.sum(diff_chain.weights))
+        _P = float(_num_filtered)/float(_num_samples)
+        _low, _upper = utils.clopper_pearson_binomial_trial(_num_filtered,
+                                                            _num_samples,
+                                                            alpha=0.32)
+    # if there are no samples try to do the integral:
+    else:
+        norm = simps(density.P, density.x)
+        _second_filter = density.P < prob_zero
+        density.P[_second_filter] = 0
+        _P = simps(density.P, density.x)/norm
+        _low, _upper = None, None
+    #
+    t1 = time.time()
+    if feedback > 0:
+        print('Time taken for 1D FFT-KDE calculation:', round(t1-t0, 1), '(s)')
+    #
+    return _P, _low, _upper
+
+
+def kde_parameter_shift_2D_fft(diff_chain, param_names=None,
+                               scale=None, nbins=1024, feedback=1,
+                               boundary_correction_order=1,
+                               mult_bias_correction_order=1,
+                               **kwarks):
     """
     Compute the MCMC estimate of the probability of a parameter shift given
     an input parameter difference chain in 2 dimensions and by using FFT.
@@ -642,9 +885,9 @@ def exact_parameter_shift_2D_fft(diff_chain, param_names=None,
     return _P, _low, _upper
 
 
-def exact_parameter_shift(diff_chain, param_names=None,
-                          scale=None, method='brute_force',
-                          feedback=1, **kwargs):
+def kde_parameter_shift(diff_chain, param_names=None,
+                        scale=None, method='brute_force',
+                        feedback=1, **kwargs):
     """
     Compute the MCMC estimate of the probability of a parameter shift given
     an input parameter difference chain.
@@ -715,45 +958,59 @@ def exact_parameter_shift(diff_chain, param_names=None,
     ind = [diff_chain.index[name] for name in param_names]
     # in the 2D case use FFT:
     use_fft = kwargs.get('use_fft', True)
-    if len(ind) == 2 and use_fft:
-        res = exact_parameter_shift_2D_fft(diff_chain,
-                                           param_names=param_names,
-                                           scale=scale,
-                                           feedback=feedback, **kwargs)
+    if len(ind) == 1 and use_fft:
+        res = kde_parameter_shift_1D_fft(diff_chain,
+                                         param_names=param_names,
+                                         scale=scale,
+                                         feedback=feedback, **kwargs)
+        _P, _low, _upper = res
+        return _P, _low, _upper
+    elif len(ind) == 2 and use_fft:
+        res = kde_parameter_shift_2D_fft(diff_chain,
+                                         param_names=param_names,
+                                         scale=scale,
+                                         feedback=feedback, **kwargs)
         _P, _low, _upper = res
         return _P, _low, _upper
     # some initial calculations:
-    _samples_cov = diff_chain.cov(pars=param_names)
     _num_samples = np.sum(diff_chain.weights)
     _num_params = len(ind)
     # number of effective samples:
     _num_samples_eff = np.sum(diff_chain.weights)**2 / \
         np.sum(diff_chain.weights**2)
+    # whighten samples:
+    _white_samples = _helper_whiten_samples(diff_chain.samples[:, ind],
+                                            diff_chain.weights)
     # scale for the kde:
-    if scale is None:
+    if scale == 'Optimal_1D' or scale is None:
         num_bins = kwargs.get('num_bins', 1000)
         scale = OptimizeBandwidth_1D(diff_chain, param_names=param_names,
                                      num_bins=num_bins)
-    elif scale == 'Silverman':
-        scale = Silvermans_RT(_num_params, _num_samples_eff)
-        scale = scale*np.ones(_num_params)
-    elif scale == 'Scott':
-        scale = Scotts_RT(_num_params, _num_samples_eff)
-        scale = scale*np.ones(_num_params)
+        scale = np.diag(scale)
+    elif scale == 'MISE':
+        scale = MISE_bandwidth_1d(_num_params, _num_samples_eff, **kwargs)
+    elif scale == 'AMISE':
+        scale = AMISE_bandwidth(_num_params, _num_samples_eff)
+    elif scale == 'MAX':
+        scale = MAX_bandwidth(_num_params, _num_samples_eff)
     elif isinstance(scale, int) or isinstance(scale, float):
-        scale = scale*np.ones(_num_params)
+        scale = scale*np.identity(int(_num_params))
+    elif isinstance(scale, np.ndarray):
+        if not scale.shape == (_num_params, _num_params):
+            raise ValueError('Input scaling matrix does not have correct size')
+        scale = scale
     # feedback:
     if feedback > 0:
         with np.printoptions(precision=3):
+            print(f'N    samples    : {int(_num_samples)}')
             print(f'Neff samples    : {_num_samples_eff:.2f}')
-            print(f'Smoothing scale :', scale)
-    # whiten the samples:
-    _temp = np.diag(np.sqrt(scale))
-    _temp = np.dot(np.dot(_temp, _samples_cov), _temp)
-    _kernel_cov = np.linalg.inv(_temp)
-    # whighten the samples:
-    _temp = sqrtm(_kernel_cov)
-    _white_samples = diff_chain.samples[:, ind].dot(_temp)
+            if np.count_nonzero(scale - np.diag(np.diagonal(scale))) == 0:
+                print(f'Smoothing scale :', np.diag(scale))
+            else:
+                print(f'Smoothing scale :', scale)
+    # scale the samples:
+    _kernel_cov = sqrtm(np.linalg.inv(scale))
+    _white_samples = _white_samples.dot(_kernel_cov)
     # probability of zero:
     _kde_prob_zero = _gauss_kde_pdf(np.zeros(_num_params),
                                     _white_samples,
@@ -790,6 +1047,37 @@ def exact_parameter_shift(diff_chain, param_names=None,
     return _P, _low, _upper
 
 
+def chi2_parameter_shift(diff_chain, param_names=None):
+    """
+    """
+    # initialize param names:
+    if param_names is None:
+        param_names = diff_chain.getParamNames().getRunningNames()
+    else:
+        chain_params = diff_chain.getParamNames().list()
+        if not np.all([name in chain_params for name in param_names]):
+            raise ValueError('Input parameter is not in the diff chain.\n',
+                             'Input parameters ', param_names, '\n'
+                             'Possible parameters', chain_params)
+    # indexes:
+    ind = [diff_chain.index[name] for name in param_names]
+    # some initial calculations:
+    _num_samples = np.sum(diff_chain.weights)
+    # whighten samples:
+    _white_samples = _helper_whiten_samples(diff_chain.samples[:, ind],
+                                            diff_chain.weights)
+
+    # compute the chi2:
+    X0 = np.average(_white_samples, axis=0, weights=diff_chain.weights)
+    _filter = (_white_samples*_white_samples).sum(axis=1) > np.dot(X0, X0)
+    _num_filtered = float(np.sum(diff_chain.weights[_filter]))
+    _P = float(_num_filtered)/float(_num_samples)
+    _low, _upper = utils.clopper_pearson_binomial_trial(_num_filtered,
+                                                        _num_samples,
+                                                        alpha=0.32)
+    #
+    return _P, _low, _upper
+
 ###############################################################################
 # Flow-based gaussianization:
 
@@ -803,7 +1091,7 @@ tfd = tfp.distributions
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input
 
-from IPython.display import clear_output, set_matplotlib_formats
+#from IPython.display import clear_output, set_matplotlib_formats
 import scipy.stats
 from . import gaussian_tension
 
