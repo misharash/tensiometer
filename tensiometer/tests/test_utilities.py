@@ -114,6 +114,40 @@ class test_clopper_pearson_binomial_trial(unittest.TestCase):
 
 ###############################################################################
 
+class test_PDM_vectorization(unittest.TestCase):
+
+    def setUp(self):
+        pass
+
+    # test values:
+    def test_values(self):
+        # generate a random vector between -1, 1 (seeded so reproducible):
+        np.random.seed(0)
+        # sweep dimensions from low to medium
+        for d in range(2, 20):
+            num = d*(d+1)//2
+            # get some random matrices:
+            for i in range(10):
+                vec = 2.*np.random.rand(num) -1.
+                # get the corresponding PDM matrix:
+                mat = vector_to_PDM(vec, d)
+                # check that it is positive definite:
+                assert np.all(np.linalg.eig(mat)[0] > 0)
+                # transform back. This can be different from the previous one
+                # because of many discrete symmetries in defining the
+                # eigenvectors
+                vec2 = PDM_to_vector(mat, d)
+                # transform again. This has to be equal, discrete symmetries for
+                # eigenvectors do not matter once they are paired with eigenvalues:
+                mat2 = vector_to_PDM(vec2, d)
+                assert np.allclose(mat, mat2)
+
+    # test raises:
+    def test_errors(self):
+        pass
+
+###############################################################################
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

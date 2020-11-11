@@ -1,11 +1,15 @@
 """
 This file contains some utilities that are used in the tensiometer package.
+
+TODO:
+    - add jit with numba as much as possible (with caching but no parallelization)
 """
 
 ###############################################################################
 # initial imports:
 
 import numpy as np
+import scipy
 import scipy.special
 from getdist import MCSamples
 
@@ -266,9 +270,96 @@ def make_list(elements):
 ###############################################################################
 
 
+def PDM_to_vector(pdm):
+    """
+    Vector representation of a positive definite matrix.
+    This does not use the Cholesky decomposition since we need guarantee of
+    strictly positive definiteness.
+
+    The absolute values of the elements with indexes of the returned vector
+    that satisfy:
+
+    .. code-block:: python
+
+        np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]
+
+    are the eigenvalues of the matrix. The sign of these elements define
+    the orientation of the eigenvectors.
+
+    Note that this is not strictly the inverse of
+    :meth:`tensiometer.utilities.vector_to_PDM`
+    since there are a number of discrete symmetries in the definition of the
+    eigenvectors that we ignore since they are irrelevant for the sake of
+    representing the matrix.
+
+    For the details of the algebra involved we refer to
+    https://arxiv.org/abs/1906.00587
+
+    :param pdm: the input positive definite matrix
+    :return: output vector representation
+    """
+    # get dimension:
+    d = pdm.shape[0]
+    # get the eigenvalues of the matrix:
+    Lambda, Phi = np.linalg.eigh(pdm)
+    # get triangular decomposition:
+    (P, L, U) = scipy.linalg.lu(Phi.T, permute_l=False)
+    # WR decomposition:
+    Q, R = np.linalg.qr(L)
+    L = np.dot(np.dot(R, U), L)
+    # pivot the eigenvalues:
+    Lambda2 = np.dot(np.dot(P.T, np.diag(Lambda)), P)
+    # prepare output:
+    mat = L
+    mat[np.diag_indices(d)] = np.sign(mat[np.diag_indices(d)])*np.diag(Lambda2)
+    #
+    return mat[np.tril_indices(d, 0)]
+
+
+def vector_to_PDM(vec):
+    """
+    Transforms an unconstrained vector of dimension :math:`d(d+1)/2`
+    into a positive definite matrix of dimension :math:`d \\times d`.
+    In the input vector the eigenvalues are in the positions where
+
+    The absolute values of the elements with indexes of the input vector
+    that satisfy:
+
+    .. code-block:: python
+
+        np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]
+
+    are the eigenvalues of the matrix. The sign of these elements define
+    the orientation of the eigenvectors.
+
+    The purpose of this function is to allow optimization over the space
+    of positive definite matrices that is either unconstrained or
+    has constraints on the condition number of the matrix.
+
+    For the details of the algebra involved we refer to
+    https://arxiv.org/abs/1906.00587
+
+    :param pdm: the input vector
+    :return: output positive definite matrix
+    """
+    d = int(np.sqrt(1 + 8*len(vec)) - 1)//2
+    L = np.zeros((d, d))
+    # get the diagonal with eigenvalues:
+    L[np.tril_indices(d, 0)] = vec
+    Lambda2 = np.diag(np.abs(L[np.diag_indices(d)]))
+    L[np.diag_indices(d)] = np.sign(L[np.diag_indices(d)]) * np.ones(d)
+    # qr decompose L:
+    Q, R = np.linalg.qr(L)
+    Phi2 = np.dot(L, np.linalg.inv(R))
+    # rebuild matrix
+    return np.dot(np.dot(Phi2.T, Lambda2), Phi2)
+
+###############################################################################
+
+
 def is_outlier(points, thresh=3.5):
     """
-    Returns a boolean array with True if points are outliers and False 
+    Returns a boolean array with True if points are outliers and False
     otherwise.
 
     Parameters:
@@ -286,7 +377,7 @@ def is_outlier(points, thresh=3.5):
     ----------
         Boris Iglewicz and David Hoaglin (1993), "Volume 16: How to Detect and
         Handle Outliers", The ASQC Basic References in Quality Control:
-        Statistical Techniques, Edward F. Mykytka, Ph.D., Editor. 
+        Statistical Techniques, Edward F. Mykytka, Ph.D., Editor.
     """
     if len(points.shape) == 1:
         points = points[:,None]
