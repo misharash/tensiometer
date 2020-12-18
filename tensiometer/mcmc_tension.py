@@ -5,16 +5,15 @@ disagreement between two different chains with Monte Carlo methods.
 For more details on the method implemented see
 `arxiv 1806.04649 <https://arxiv.org/pdf/1806.04649.pdf>`_
 and `arxiv 1912.04880 <https://arxiv.org/pdf/1912.04880.pdf>`_.
-"""
 
-"""
+
 For test purposes:
 
 from getdist import loadMCSamples, MCSamples, WeightedSamples
-chain_1 = loadMCSamples('./test_chains/DES')
-chain_2 = loadMCSamples('./test_chains/Planck18TTTEEE')
-chain_12 = loadMCSamples('./test_chains/Planck18TTTEEE_DES')
-chain_prior = loadMCSamples('./test_chains/prior')
+chain_1 = loadMCSamples('./tensiometer/test_chains/DES')
+chain_2 = loadMCSamples('./tensiometer/test_chains/Planck18TTTEEE')
+chain_12 = loadMCSamples('./tensiometer/test_chains/Planck18TTTEEE_DES')
+chain_prior = loadMCSamples('./tensiometer/test_chains/prior')
 
 import tensiometer.utilities as utils
 import matplotlib.pyplot as plt
@@ -30,7 +29,7 @@ n_threads = 1
 """
 
 ###############################################################################
-# initial imports:
+# initial imports and set-up:
 
 import os
 import time
@@ -55,12 +54,6 @@ if 'OMP_NUM_THREADS' in os.environ.keys():
     n_threads = int(os.environ['OMP_NUM_THREADS'])
 else:
     n_threads = multiprocessing.cpu_count()
-
-# imports for manifold optimization:
-import autograd.numpy as anp
-from pymanopt.manifolds import PositiveDefinite, PSDFixedRank, Elliptope
-from pymanopt import Problem
-import pymanopt.solvers
 
 ###############################################################################
 # Parameter difference chain:
@@ -381,9 +374,11 @@ def MISE_bandwidth_1d(num_params, num_samples, **kwargs):
         alpha0 = AMISE_bandwidth(num_params, num_samples)[0, 0]
     d, n = num_params, num_samples
     # explicit optimization:
-    opt = scipy.optimize.minimize(lambda alpha: _mise1d_optimizer(np.exp(alpha), d, n),
+    opt = scipy.optimize.minimize(lambda alpha:
+                                  _mise1d_optimizer(np.exp(alpha), d, n),
                                   np.log(alpha0),
-                                  jac=lambda alpha: _mise1d_optimizer_jac(np.exp(alpha), d, n),
+                                  jac=lambda alpha:
+                                  _mise1d_optimizer_jac(np.exp(alpha), d, n),
                                   **kwargs)
     # check for success:
     if not opt.success:
@@ -392,34 +387,42 @@ def MISE_bandwidth_1d(num_params, num_samples, **kwargs):
     return np.exp(opt.x[0]) * np.identity(num_params)
 
 
+@jit(nopython=True, fastmath=True)
 def _mise_optimizer(H, d, n):
-    Id = anp.identity(d, dtype='float')
-    tmp = 1./anp.sqrt(anp.linalg.det(2.*H))/n
-    tmp = tmp + (1.-1./n)/anp.sqrt(anp.linalg.det(2.*H + 2.*Id)) \
-        - 2./anp.sqrt(anp.linalg.det(H + 2.*Id)) + anp.power(2., -d/2.)
+    Id = np.identity(d)
+    tmp = 1./np.sqrt(np.linalg.det(2.*H))/n
+    tmp = tmp + (1.-1./n)/np.sqrt(np.linalg.det(2.*H + 2.*Id)) \
+        - 2./np.sqrt(np.linalg.det(H + 2.*Id)) + np.power(2., -d/2.)
     return tmp
 
 
-def MISE_bandwidth(num_params, num_samples, **kwargs):
+def MISE_bandwidth(num_params, num_samples, feedback=0, **kwargs):
     """
     """
     # initial calculations:
     alpha0 = kwargs.pop('alpha0', None)
     if alpha0 is None:
         alpha0 = MISE_bandwidth_1d(num_params, num_samples)
+    alpha0 = utils.PDM_to_vector(alpha0)
     d, n = num_params, num_samples
-    # initialize manifold:
-    manifold = PositiveDefinite(d, k=1)
-    problem = Problem(manifold=manifold,
-                      cost=lambda x: _mise_optimizer(x, d, n), **kwargs)
-    solver = pymanopt.solvers.TrustRegions(logverbosity=0)
-    Xopt = solver.solve(problem, x=alpha0)
+    # build a constraint:
+    bounds = kwargs.pop('bounds', None)
+    if bounds is None:
+        bounds = np.array([[None, None] for i in range(d*(d+1)//2)])
+        bounds[np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]] = [alpha0[0]/100, alpha0[0]*100]
+    # explicit optimization:
+    opt = scipy.optimize.minimize(lambda x: _mise_optimizer(utils.vector_to_PDM(x), d, n),
+                                  x0=alpha0, bounds=bounds, **kwargs)
+    # check for success:
+    if not opt.success or feedback > 2:
+        print('MISE_bandwidth')
+        print(opt)
     #
-    return Xopt
+    return utils.vector_to_PDM(opt.x)
 
 
 @jit(nopython=True, fastmath=True, parallel=True)
-def _UCV_optimizer(H, weights, white_samples):
+def _UCV_optimizer_brute_force(H, weights, white_samples):
     """
     Note this solves for sqrt(H)
     """
@@ -447,7 +450,7 @@ def _UCV_optimizer(H, weights, white_samples):
     return (fac/neff + res)/detH
 
 
-def _UCV_optimizer(H, weights, white_samples, n_nearest=20):
+def _UCV_optimizer_nearest(H, weights, white_samples, n_nearest=20):
     """
     Note this solves for sqrt(H) and uses a truncated KD-tree
     """
@@ -465,16 +468,84 @@ def _UCV_optimizer(H, weights, white_samples, n_nearest=20):
     # KD-tree computation:
     data_tree = cKDTree(samps, balanced_tree=True)
     # query for nearest neighbour:
-    d, idx = data_tree.query(samps, np.arange(2, n_nearest), n_jobs=-1)
-    d = np.square(d)
-    temp = weights[:, None]*weights[idx]*(fac*np.exp(-0.25*d)
-                                          - 2.*np.exp(-0.5*d)*alpha[:, None])
+    r2, idx = data_tree.query(samps, np.arange(2, n_nearest), n_jobs=-1)
+    r2 = np.square(r2)
+    temp = weights[:, None]*weights[idx]*(fac*np.exp(-0.25*r2)
+                                          - 2.*np.exp(-0.5*r2)*alpha[:, None])
     res = np.sum(temp) / wtot**2
     #
     return (fac/neff + res)/detH
 
 
-def UCV_bandwidth_1d(weights, white_samples, **kwargs):
+def UCV_bandwidth(weights, white_samples, alpha0=None, feedback=0, mode='full', **kwargs):
+    """
+    """
+    # digest input:
+    n, d = white_samples.shape
+    n_nearest = kwargs.pop('n_nearest', 20)
+    # get number of effective samples:
+    wtot = np.sum(weights)
+    neff = wtot**2 / np.sum(weights**2)
+    # initial guess calculations:
+    t0 = time.time()
+    if alpha0 is None:
+        alpha0 = AMISE_bandwidth(d, neff)
+    # select mode:
+    if mode == '1d':
+        opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer_nearest(np.sqrt(np.exp(alpha)) * np.identity(d), weights, white_samples, n_nearest),
+                                      np.log(alpha0[0, 0]), **kwargs)
+        res = np.exp(opt.x[0]) * np.identity(d)
+    elif mode == 'diag':
+        opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer_nearest(np.diag(np.sqrt(np.exp(alpha))), weights, white_samples, n_nearest),
+                                      x0=np.log(np.diag(alpha0)), **kwargs)
+        res = np.diag(np.exp(opt.x))
+    elif mode == 'full':
+        # build a constraint:
+        bounds = kwargs.pop('bounds', None)
+        if bounds is None:
+            bounds = np.array([[None, None] for i in range(d*(d+1)//2)])
+            bounds[np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]] = [alpha0[0, 0]/10, alpha0[0, 0]*10]
+        # explicit optimization:
+        alpha0 = utils.PDM_to_vector(sqrtm(alpha0))
+        opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer_nearest(utils.vector_to_PDM(alpha), weights, white_samples, n_nearest),
+                                      x0=alpha0, bounds=bounds, **kwargs)
+        res = utils.vector_to_PDM(opt.x)
+        res = np.dot(res, res)
+    # check for success and final feedback:
+    if not opt.success or feedback > 2:
+        print(opt)
+    if feedback > 0:
+        t1 = time.time()
+        print('Time taken for UCV_bandwidth '+mode+' calculation:',
+              round(t1-t0, 1), '(s)')
+    #
+    return res
+
+
+@jit(nopython=True, fastmath=True)
+def _MSE_CV_optimizer(H, weights, white_samples, K0):
+    """
+    Note this solves for sqrt(H)
+    """
+    # digest:
+    n, d = white_samples.shape
+    fac = (2*np.pi)**(-d/2.)
+    # compute the weights vectors:
+    wtot = np.sum(weights)
+    # compute determinant:
+    detH = np.linalg.det(H)
+    # whiten samples with inverse H:
+    X = white_samples.dot(np.linalg.inv(H))
+    # compute kernel:
+    K = fac/detH*np.exp(-0.5*(X*X).sum(axis=1))
+    temp = np.dot(weights, K)
+    temp = ((wtot - weights)*K0 - (temp - weights*K))**2
+    fac = (weights / (wtot - weights))**2
+    #
+    return np.dot(fac, temp)
+
+
+def MSE_CV_bandwidth(weights, white_samples, alpha0=None, feedback=0, mode='full', **kwargs):
     """
     """
     # digest input:
@@ -483,124 +554,53 @@ def UCV_bandwidth_1d(weights, white_samples, **kwargs):
     wtot = np.sum(weights)
     neff = wtot**2 / np.sum(weights**2)
     # initial guess calculations:
-    alpha0 = AMISE_bandwidth(d, neff)[0, 0]
-    # explicit optimization:
-    opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer(np.sqrt(np.exp(alpha)) * np.identity(d), weights, white_samples, **kwargs),
-                                  np.log(alpha0), **kwargs)
+    t0 = time.time()
+    if alpha0 is None:
+        alpha0 = AMISE_bandwidth(d, neff)
+    # initial calculation of K0:
+    H0 = sqrtm(alpha0)
+    fac = (2*np.pi)**(-d/2.)
+    detH0 = np.linalg.det(H0)
+    X = white_samples.dot(np.linalg.inv(H0))
+    K0 = fac/detH0*np.exp(-0.5*(X*X).sum(axis=1))
+    # select mode:
+    if mode == '1d':
+        opt = scipy.optimize.minimize(lambda alpha: _MSE_CV_optimizer(np.sqrt(np.exp(alpha)) * np.identity(d), weights, white_samples, K0),
+                                      np.log(100*alpha0[0,0]), **kwargs)
+        res = np.exp(opt.x[0]) * np.identity(d)
+    elif mode == 'diag':
+        opt = scipy.optimize.minimize(lambda alpha: _MSE_CV_optimizer(np.diag(np.sqrt(np.exp(alpha))), weights, white_samples, K0),
+                                      x0=np.log(np.diag(100*alpha0)), **kwargs)
+        res = np.diag(np.exp(opt.x))
+    elif mode == 'full':
+        # build a constraint:
+        bounds = kwargs.pop('bounds', None)
+        if bounds is None:
+            bounds = np.array([[None, None] for i in range(d*(d+1)//2)])
+            bounds[np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]] = [alpha0[0, 0]/100, alpha0[0, 0]*200]
+        # explicit optimization:
+        alpha0 = utils.PDM_to_vector(sqrtm(100*alpha0))
+        opt = scipy.optimize.minimize(lambda alpha: _MSE_CV_optimizer(utils.vector_to_PDM(alpha), weights, white_samples, K0),
+                                      x0=alpha0, bounds=bounds, **kwargs)
+        res = utils.vector_to_PDM(opt.x)
+        res = np.dot(res, res)
     # check for success:
-    if not opt.success:
+    if not opt.success or feedback > 2:
+        print('MSE_CV_bandwidth')
         print(opt)
+    # some feedback:
+    if feedback > 0:
+        t1 = time.time()
+        print('Time taken for MSE_CV_bandwidth calculation:',
+              round(t1-t0, 1), '(s)')
     #
-    return np.sqrt(np.exp(opt.x[0])) * np.identity(d)
-
-
-def UCV_bandwidth_diag(weights, white_samples, **kwargs):
-    """
-    """
-    # digest input:
-    n, d = white_samples.shape
-    # get number of effective samples:
-    wtot = np.sum(weights)
-    neff = wtot**2 / np.sum(weights**2)
-    # initial guess calculations:
-    alpha0 = np.diag(AMISE_bandwidth(d, neff))
-    # explicit optimization:
-    opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer(np.diag(np.sqrt(np.exp(alpha))), weights, white_samples, **kwargs),
-                                  x0=np.log(alpha0), **kwargs)
-    # check for success:
-    if not opt.success:
-        print(opt)
-    #
-    return np.diag(np.sqrt(np.exp(opt.x)))
-
-
-def UCV_bandwidth(weights, white_samples, **kwargs):
-    """
-    """
-    # digest input:
-    n, d = white_samples.shape
-    # get number of effective samples:
-    wtot = np.sum(weights)
-    neff = wtot**2 / np.sum(weights**2)
-    # initial guess calculations:
-    alpha0 = PDM_to_vector(np.sqrt(AMISE_bandwidth(d, neff)), d)
-    # build a constraint:
-    bounds = kwargs.pop('bounds', None)
-    if bounds is None:
-        bounds = np.array([[None, None] for i in range(d*(d+1)//2)])
-        bounds[np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]] = [alpha0[0]/10, alpha0[0]*10]
-    # explicit optimization:
-    opt = scipy.optimize.minimize(lambda alpha: _UCV_optimizer(vector_to_PDM(alpha, d), weights, white_samples, **kwargs),
-                                  x0=alpha0, bounds=bounds, **kwargs)
-    # check for success:
-    if not opt.success:
-        print(opt)
-    #
-    return sqrtm(vector_to_PDM(opt.x, d))
-
-
-def OptimizeBandwidth_1D(diff_chain, param_names=None, num_bins=1000):
-    """
-    Compute an estimate of an optimal bandwidth for covariance scaling as in
-    GetDist. This is performed on whitened samples (with identity covariance),
-    in 1D, and then scaled up with a dimensionality correction.
-    This is by no means optimal in any sense but might work
-
-    :param diff_chain:
-    :param param_names:
-    :param num_bins: number of bins used for the 1D estimate
-    :return: scaling vector for the whitened parameters
-    """
-    # initialize param names:
-    if param_names is None:
-        param_names = diff_chain.getParamNames().getRunningNames()
-    else:
-        chain_params = diff_chain.getParamNames().list()
-        if not np.all([name in chain_params for name in param_names]):
-            raise ValueError('Input parameter is not in the diff chain.\n',
-                             'Input parameters ', param_names, '\n'
-                             'Possible parameters', chain_params)
-    # indexes:
-    ind = [diff_chain.index[name] for name in param_names]
-    # some initial calculations:
-    _samples_cov = diff_chain.cov(pars=param_names)
-    _num_params = len(ind)
-    # whiten the samples:
-    _temp = sqrtm(utils.QR_inverse(_samples_cov))
-    white_samples = diff_chain.samples[:, ind].dot(_temp)
-    # make these samples so that we can use GetDist band optization:
-    temp_samples = MCSamples(samples=white_samples,
-                             weights=diff_chain.weights,
-                             ignore_rows=0, sampler=diff_chain.sampler)
-    # now get optimal band for each parameter:
-    bands = []
-    for i in range(_num_params):
-        # get the parameter:
-        par = temp_samples._initParamRanges(i, paramConfid=None)
-        # get the bins:
-        temp_result = temp_samples._binSamples(temp_samples.samples[:, i],
-                                               par, num_bins)
-        bin_indices, bin_width, binmin, binmax = temp_result
-        bins = np.bincount(bin_indices, weights=temp_samples.weights,
-                           minlength=num_bins)
-        # get the optimal smoothing scale:
-        N_eff = temp_samples._get1DNeff(par, i)
-        band = temp_samples.getAutoBandwidth1D(bins, par, i, N_eff=N_eff,
-                                               mult_bias_correction_order=0,
-                                               kernel_order=0) \
-            * (binmax - binmin)
-        # correction for dimensionality:
-        dim_factor = Scotts_bandwidth(_num_params, N_eff)[0,0]/Scotts_bandwidth(1., N_eff)[0,0]
-        #
-        bands.append(band**2.*dim_factor)
-    #
-    return np.array(bands)
+    return res
 
 ###############################################################################
 # Parameter difference integrals:
 
 
-def _gauss_kde_pdf(x, samples, weights):
+def _gauss_kde_logpdf(x, samples, weights):
     """
     Utility function to compute the Gaussian log KDE probability at x from
     already whitened samples, possibly with weights.
@@ -622,7 +622,7 @@ def _brute_force_parameter_shift(white_samples, weights, zero_prob,
     else:
         def feedback_helper(x): return x
     # select kernel:
-    log_kernel = _gauss_kde_pdf
+    log_kernel = _gauss_kde_logpdf
     # run:
     with joblib.Parallel(n_jobs=n_threads) as parallel:
         _kde_eval_pdf = parallel(joblib.delayed(log_kernel)
@@ -636,8 +636,8 @@ def _brute_force_parameter_shift(white_samples, weights, zero_prob,
     return _num_filtered
 
 
-def _nearest_parameter_shift(white_samples, weights, zero_prob, num_samples,
-                             feedback, **kwargs):
+def _neighbor_parameter_shift(white_samples, weights, zero_prob, num_samples,
+                              feedback, **kwargs):
     """
     """
     # import specific for this function:
@@ -653,7 +653,7 @@ def _nearest_parameter_shift(white_samples, weights, zero_prob, num_samples,
     # the tree elimination has to work with probabilities to go incremental:
     _zero_prob = np.exp(zero_prob)
     # build tree:
-    if feedback > 0:
+    if feedback > 1:
         print('Building KD-Tree')
     data_tree = cKDTree(white_samples, leafsize=chunk_size,
                         balanced_tree=True)
@@ -666,7 +666,7 @@ def _nearest_parameter_shift(white_samples, weights, zero_prob, num_samples,
     _last_n = 0
     _stable_cycle = 0
     # loop over the neighbours:
-    if feedback > 0:
+    if feedback > 1:
         print('Neighbours elimination')
     for i in range(_num_elements//chunk_size):
         ind_min = chunk_size*i
@@ -678,8 +678,8 @@ def _nearest_parameter_shift(white_samples, weights, zero_prob, num_samples,
             * np.exp(-0.5*np.square(_dist[:, ind_min:ind_max])), axis=1)
         _filter[_filter] = _kde_eval_pdf[_filter] < _zero_prob
         _num_filtered = np.sum(_filter)
-        if feedback > 1:
-            print('nearest_elimination: chunk', i+1)
+        if feedback > 2:
+            print('neighbor_elimination: chunk', i+1)
             print('    surviving elements', _num_filtered,
                   'of', _num_elements)
         # check if calculation has converged:
@@ -698,14 +698,14 @@ def _nearest_parameter_shift(white_samples, weights, zero_prob, num_samples,
     # clean up memory:
     del(data_tree)
     # brute force the leftovers:
-    if feedback > 0:
-        print('nearest_elimination: polishing')
+    if feedback > 1:
+        print('neighbor_elimination: polishing')
     with joblib.Parallel(n_jobs=n_threads) as parallel:
-        _kde_eval_pdf[_filter] = parallel(joblib.delayed(_gauss_kde_pdf)
+        _kde_eval_pdf[_filter] = parallel(joblib.delayed(_gauss_kde_logpdf)
                                           (samp, white_samples, weights)
                                           for samp in feedback_helper(white_samples[_filter]))
         _filter[_filter] = _kde_eval_pdf[_filter] < np.log(_zero_prob)
-    if feedback > 0:
+    if feedback > 1:
         print('    surviving elements', np.sum(_filter),
               'of', _num_elements)
     # compute number of filtered elements:
@@ -918,7 +918,7 @@ def kde_parameter_shift(diff_chain, param_names=None,
           method scales as :math:`O(n_{\\rm samples}^2)` and can be afforded
           only for small tensions. When suspecting a difference that is
           larger than 95% other methods are better.
-        * method = nearest_elimination is a KD Tree based elimination method.
+        * method = neighbor_elimination is a KD Tree based elimination method.
           For large tensions this scales as
           :math:`O(n_{\\rm samples}\\log(n_{\\rm samples}))`
           and in worse case scenarions, with small tensions, this can scale
@@ -927,12 +927,12 @@ def kde_parameter_shift(diff_chain, param_names=None,
           When expecting a statistically significant difference in parameters
           this is the recomended algorithm.
 
-        Suggestion is to go with brute force for small problems, nearest
+        Suggestion is to go with brute force for small problems, neighbor
         elimination for big problems with signifcant tensions.
     :param feedback: (optional) print to screen the time taken
         for the calculation.
     :param kwargs: extra options to pass to the KDE algorithm.
-        The nearest_elimination algorithm accepts the following optional
+        The neighbor_elimination algorithm accepts the following optional
         arguments:
 
         * stable_cycle: (default 2) number of elimination cycles that show
@@ -982,16 +982,11 @@ def kde_parameter_shift(diff_chain, param_names=None,
     _white_samples = _helper_whiten_samples(diff_chain.samples[:, ind],
                                             diff_chain.weights)
     # scale for the kde:
-    if scale == 'Optimal_1D' or scale is None:
-        num_bins = kwargs.get('num_bins', 1000)
-        scale = OptimizeBandwidth_1D(diff_chain, param_names=param_names,
-                                     num_bins=num_bins)
-        scale = np.diag(scale)
-    elif scale == 'MISE':
+    if isinstance(scale, str) and scale == 'MISE':
         scale = MISE_bandwidth_1d(_num_params, _num_samples_eff, **kwargs)
-    elif scale == 'AMISE':
+    elif isinstance(scale, str) and scale == 'AMISE':
         scale = AMISE_bandwidth(_num_params, _num_samples_eff)
-    elif scale == 'MAX':
+    elif isinstance(scale, str) and scale == 'MAX':
         scale = MAX_bandwidth(_num_params, _num_samples_eff)
     elif isinstance(scale, int) or isinstance(scale, float):
         scale = scale*np.identity(int(_num_params))
@@ -1012,9 +1007,9 @@ def kde_parameter_shift(diff_chain, param_names=None,
     _kernel_cov = sqrtm(np.linalg.inv(scale))
     _white_samples = _white_samples.dot(_kernel_cov)
     # probability of zero:
-    _kde_prob_zero = _gauss_kde_pdf(np.zeros(_num_params),
-                                    _white_samples,
-                                    diff_chain.weights)
+    _kde_prob_zero = _gauss_kde_logpdf(np.zeros(_num_params),
+                                       _white_samples,
+                                       diff_chain.weights)
     # compute the KDE:
     t0 = time.time()
     if method == 'brute_force':
@@ -1023,12 +1018,12 @@ def kde_parameter_shift(diff_chain, param_names=None,
                                                      _kde_prob_zero,
                                                      _num_samples,
                                                      feedback)
-    elif method == 'nearest_elimination':
-        _num_filtered = _nearest_parameter_shift(_white_samples,
-                                                 diff_chain.weights,
-                                                 _kde_prob_zero,
-                                                 _num_samples,
-                                                 feedback, **kwargs)
+    elif method == 'neighbor_elimination':
+        _num_filtered = _neighbor_parameter_shift(_white_samples,
+                                                  diff_chain.weights,
+                                                  _kde_prob_zero,
+                                                  _num_samples,
+                                                  feedback, **kwargs)
     else:
         raise ValueError('Unknown method provided:', method)
     t1 = time.time()
@@ -1066,7 +1061,6 @@ def chi2_parameter_shift(diff_chain, param_names=None):
     # whighten samples:
     _white_samples = _helper_whiten_samples(diff_chain.samples[:, ind],
                                             diff_chain.weights)
-
     # compute the chi2:
     X0 = np.average(_white_samples, axis=0, weights=diff_chain.weights)
     _filter = (_white_samples*_white_samples).sum(axis=1) > np.dot(X0, X0)
