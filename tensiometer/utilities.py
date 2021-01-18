@@ -164,6 +164,27 @@ def clopper_pearson_binomial_trial(k, n, alpha=0.32):
 ###############################################################################
 
 
+def min_samples_for_tension(nsigma, sigma_err):
+    """
+    """
+    P = from_sigma_to_confidence(nsigma)
+
+    def dummy(n):
+        _dn, _up = clopper_pearson_binomial_trial(max(P, 1.-P)*n, n)
+        _err_up = from_confidence_to_sigma(max(P, 1.-P)) - from_confidence_to_sigma(_dn)
+        _err_dn = from_confidence_to_sigma(_up) - from_confidence_to_sigma(max(P, 1.-P))
+        return 0.5*(_err_up + _err_dn) - sigma_err
+    try:
+        n = scipy.optimize.brentq(lambda x: dummy(np.exp(x)), 0., 30.)
+        n = np.exp(n)
+    except ValueError:
+        n = np.nan
+    return n
+
+
+###############################################################################
+
+
 def get_separate_mcsamples(chain):
     """
     Function that returns separate :class:`~getdist.mcsamples.MCSamples`

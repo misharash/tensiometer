@@ -982,7 +982,7 @@ def kde_parameter_shift(diff_chain, param_names=None,
     _white_samples = _helper_whiten_samples(diff_chain.samples[:, ind],
                                             diff_chain.weights)
     # scale for the kde:
-    if isinstance(scale, str) and scale == 'MISE':
+    if (isinstance(scale, str) and scale == 'MISE') or scale is None:
         scale = MISE_bandwidth_1d(_num_params, _num_samples_eff, **kwargs)
     elif isinstance(scale, str) and scale == 'AMISE':
         scale = AMISE_bandwidth(_num_params, _num_samples_eff)
