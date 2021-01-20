@@ -992,7 +992,9 @@ def kde_parameter_shift(diff_chain, param_names=None,
         scale = scale*np.identity(int(_num_params))
     elif isinstance(scale, np.ndarray):
         if not scale.shape == (_num_params, _num_params):
-            raise ValueError('Input scaling matrix does not have correct size')
+            raise ValueError('Input scaling matrix does not have correct '
+                             + 'size \n Input shape: '+str(scale.shape)
+                             + '\nNumber of parameters: '+str(_num_params))
         scale = scale
     # feedback:
     if feedback > 0:

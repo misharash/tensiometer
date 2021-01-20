@@ -60,7 +60,7 @@ def MCSamplesFromCosmosis(chain_root, param_label_dict=None, name_tag=None,
     if sampler == 'nested':
         # get number of samples to use:
         nsamples = int(list(filter(lambda x: 'nsample=' in x, info))
-                       [0].split('=')[1])
+                       [0].replace(' ', '').split('=')[1])
         # get the chain:
         chain = chain[-nsamples:]
         # get all quantities:
@@ -190,7 +190,7 @@ def get_sampler_type(info):
     # find the sampler in the parameters:
     temp = list(filter(lambda x: 'sampler' in x, info))
     if len(temp) > 0:
-        sampler = temp[0].split('=')[1].lower()
+        sampler = temp[0].replace(' ', '').split('=')[1].lower()
         if sampler in sampler_dict.keys():
             sampler = sampler_dict[sampler]
         else:
@@ -211,7 +211,7 @@ def get_name_tag(info):
     """
     temp = list(filter(lambda x: 'run_name' in x, info))
     if len(temp) > 0:
-        name_tag = temp[0].split('=')[1].lower()
+        name_tag = temp[0].replace(' ', '').split('=')[1].lower()
         name_tag = name_tag.rstrip().lstrip()
     else:
         name_tag = None
