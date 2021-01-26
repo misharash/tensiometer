@@ -11,6 +11,7 @@ TODO:
 import numpy as np
 import scipy
 import scipy.special
+from scipy.linalg import sqrtm
 from getdist import MCSamples
 
 ###############################################################################
@@ -374,6 +375,21 @@ def vector_to_PDM(vec):
     Phi2 = np.dot(L, np.linalg.inv(R))
     # rebuild matrix
     return np.dot(np.dot(Phi2.T, Lambda2), Phi2)
+
+###############################################################################
+
+
+def whiten_samples(samples, weights):
+    """
+    """
+    # compute sample covariance:
+    _cov = np.cov(samples.T, aweights=weights)
+    # compute its inverse square root:
+    _temp = sqrtm(QR_inverse(_cov))
+    # whiten the samples:
+    white_samples = samples.dot(_temp)
+    #
+    return white_samples
 
 ###############################################################################
 

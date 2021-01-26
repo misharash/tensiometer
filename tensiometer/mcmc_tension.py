@@ -298,19 +298,6 @@ def parameter_diff_chain(chain_1, chain_2, boost=1):
 # KDE bandwidth selection:
 
 
-def _helper_whiten_samples(samples, weights):
-    """
-    """
-    # compute sample covariance:
-    _cov = np.cov(samples.T, aweights=weights)
-    # compute its inverse square root:
-    _temp = sqrtm(utils.QR_inverse(_cov))
-    # whiten the samples:
-    white_samples = samples.dot(_temp)
-    #
-    return white_samples
-
-
 def Scotts_bandwidth(num_params, num_samples):
     """
     Compute Scott's rule of thumb bandwidth covariance scaling.
@@ -521,81 +508,6 @@ def UCV_bandwidth(weights, white_samples, alpha0=None, feedback=0, mode='full', 
     #
     return res
 
-
-@jit(nopython=True, fastmath=True)
-def _MSE_CV_optimizer(H, weights, white_samples, K0):
-    """
-    Note this solves for sqrt(H)
-    """
-    # digest:
-    n, d = white_samples.shape
-    fac = (2*np.pi)**(-d/2.)
-    # compute the weights vectors:
-    wtot = np.sum(weights)
-    # compute determinant:
-    detH = np.linalg.det(H)
-    # whiten samples with inverse H:
-    X = white_samples.dot(np.linalg.inv(H))
-    # compute kernel:
-    K = fac/detH*np.exp(-0.5*(X*X).sum(axis=1))
-    temp = np.dot(weights, K)
-    temp = ((wtot - weights)*K0 - (temp - weights*K))**2
-    fac = (weights / (wtot - weights))**2
-    #
-    return np.dot(fac, temp)
-
-
-def MSE_CV_bandwidth(weights, white_samples, alpha0=None, feedback=0, mode='full', **kwargs):
-    """
-    """
-    # digest input:
-    n, d = white_samples.shape
-    # get number of effective samples:
-    wtot = np.sum(weights)
-    neff = wtot**2 / np.sum(weights**2)
-    # initial guess calculations:
-    t0 = time.time()
-    if alpha0 is None:
-        alpha0 = AMISE_bandwidth(d, neff)
-    # initial calculation of K0:
-    H0 = sqrtm(alpha0)
-    fac = (2*np.pi)**(-d/2.)
-    detH0 = np.linalg.det(H0)
-    X = white_samples.dot(np.linalg.inv(H0))
-    K0 = fac/detH0*np.exp(-0.5*(X*X).sum(axis=1))
-    # select mode:
-    if mode == '1d':
-        opt = scipy.optimize.minimize(lambda alpha: _MSE_CV_optimizer(np.sqrt(np.exp(alpha)) * np.identity(d), weights, white_samples, K0),
-                                      np.log(100*alpha0[0,0]), **kwargs)
-        res = np.exp(opt.x[0]) * np.identity(d)
-    elif mode == 'diag':
-        opt = scipy.optimize.minimize(lambda alpha: _MSE_CV_optimizer(np.diag(np.sqrt(np.exp(alpha))), weights, white_samples, K0),
-                                      x0=np.log(np.diag(100*alpha0)), **kwargs)
-        res = np.diag(np.exp(opt.x))
-    elif mode == 'full':
-        # build a constraint:
-        bounds = kwargs.pop('bounds', None)
-        if bounds is None:
-            bounds = np.array([[None, None] for i in range(d*(d+1)//2)])
-            bounds[np.tril_indices(d, 0)[0] == np.tril_indices(d, 0)[1]] = [alpha0[0, 0]/100, alpha0[0, 0]*200]
-        # explicit optimization:
-        alpha0 = utils.PDM_to_vector(sqrtm(100*alpha0))
-        opt = scipy.optimize.minimize(lambda alpha: _MSE_CV_optimizer(utils.vector_to_PDM(alpha), weights, white_samples, K0),
-                                      x0=alpha0, bounds=bounds, **kwargs)
-        res = utils.vector_to_PDM(opt.x)
-        res = np.dot(res, res)
-    # check for success:
-    if not opt.success or feedback > 2:
-        print('MSE_CV_bandwidth')
-        print(opt)
-    # some feedback:
-    if feedback > 0:
-        t1 = time.time()
-        print('Time taken for MSE_CV_bandwidth calculation:',
-              round(t1-t0, 1), '(s)')
-    #
-    return res
-
 ###############################################################################
 # Parameter difference integrals:
 
@@ -607,10 +519,10 @@ def _gauss_kde_logpdf(x, samples, weights):
     Normalization constants are ignored.
     """
     X = x-samples
-    return np.log(np.dot(weights, np.exp(-0.5*(X*X).sum(axis=1))))
+    return scipy.special.logsumexp(-0.5*(X*X).sum(axis=1), b=weights)
 
 
-def _brute_force_parameter_shift(white_samples, weights, zero_prob,
+def _brute_force_kde_param_shift(white_samples, weights, zero_prob,
                                  num_samples, feedback):
     """
     Brute force parallelized algorithm for parameter shift.
@@ -956,22 +868,6 @@ def kde_parameter_shift(diff_chain, param_names=None,
                              'Possible parameters', chain_params)
     # indexes:
     ind = [diff_chain.index[name] for name in param_names]
-    # in the 2D case use FFT:
-    use_fft = kwargs.get('use_fft', True)
-    if len(ind) == 1 and use_fft:
-        res = kde_parameter_shift_1D_fft(diff_chain,
-                                         param_names=param_names,
-                                         scale=scale,
-                                         feedback=feedback, **kwargs)
-        _P, _low, _upper = res
-        return _P, _low, _upper
-    elif len(ind) == 2 and use_fft:
-        res = kde_parameter_shift_2D_fft(diff_chain,
-                                         param_names=param_names,
-                                         scale=scale,
-                                         feedback=feedback, **kwargs)
-        _P, _low, _upper = res
-        return _P, _low, _upper
     # some initial calculations:
     _num_samples = np.sum(diff_chain.weights)
     _num_params = len(ind)
@@ -979,8 +875,8 @@ def kde_parameter_shift(diff_chain, param_names=None,
     _num_samples_eff = np.sum(diff_chain.weights)**2 / \
         np.sum(diff_chain.weights**2)
     # whighten samples:
-    _white_samples = _helper_whiten_samples(diff_chain.samples[:, ind],
-                                            diff_chain.weights)
+    _white_samples = utils.whiten_samples(diff_chain.samples[:, ind],
+                                          diff_chain.weights)
     # scale for the kde:
     if (isinstance(scale, str) and scale == 'MISE') or scale is None:
         scale = MISE_bandwidth_1d(_num_params, _num_samples_eff, **kwargs)
@@ -1015,7 +911,7 @@ def kde_parameter_shift(diff_chain, param_names=None,
     # compute the KDE:
     t0 = time.time()
     if method == 'brute_force':
-        _num_filtered = _brute_force_parameter_shift(_white_samples,
+        _num_filtered = _brute_force_kde_param_shift(_white_samples,
                                                      diff_chain.weights,
                                                      _kde_prob_zero,
                                                      _num_samples,
@@ -1043,36 +939,6 @@ def kde_parameter_shift(diff_chain, param_names=None,
     #
     return _P, _low, _upper
 
-
-def chi2_parameter_shift(diff_chain, param_names=None):
-    """
-    """
-    # initialize param names:
-    if param_names is None:
-        param_names = diff_chain.getParamNames().getRunningNames()
-    else:
-        chain_params = diff_chain.getParamNames().list()
-        if not np.all([name in chain_params for name in param_names]):
-            raise ValueError('Input parameter is not in the diff chain.\n',
-                             'Input parameters ', param_names, '\n'
-                             'Possible parameters', chain_params)
-    # indexes:
-    ind = [diff_chain.index[name] for name in param_names]
-    # some initial calculations:
-    _num_samples = np.sum(diff_chain.weights)
-    # whighten samples:
-    _white_samples = _helper_whiten_samples(diff_chain.samples[:, ind],
-                                            diff_chain.weights)
-    # compute the chi2:
-    X0 = np.average(_white_samples, axis=0, weights=diff_chain.weights)
-    _filter = (_white_samples*_white_samples).sum(axis=1) > np.dot(X0, X0)
-    _num_filtered = float(np.sum(diff_chain.weights[_filter]))
-    _P = float(_num_filtered)/float(_num_samples)
-    _low, _upper = utils.clopper_pearson_binomial_trial(_num_filtered,
-                                                        _num_samples,
-                                                        alpha=0.32)
-    #
-    return _P, _low, _upper
 
 ###############################################################################
 # Flow-based gaussianization:
@@ -1296,8 +1162,6 @@ class DiffFlowCallback(tf.keras.callbacks.Callback):
         plt.show()
 
 
-
-
 def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.leaky_relu, permutations=True, feedback=0, **kwargs):
     """[summary]
 
@@ -1342,7 +1206,7 @@ def _build_dist_maf(num_params, n_maf=None, hidden_units=None, activation=tf.nn.
 
     bijector = tfb.Chain(bijectors)
 
-    if feedback>0:
+    if feedback > 0:
         print("Building MAF")
         print("    - number of MAFs:", n_maf)
         # print("    - trainable parameters:", model.count_params())
